@@ -31,6 +31,38 @@ class GeminiError(RuntimeError):
     """Ошибка при обращении к Gemini (нет ключа, сбой сети, блокировка)."""
 
 
+class GeminiLimitError(GeminiError):
+    """Лимит бесплатного тарифа исчерпан (429) или сервер перегружен (503).
+
+    Ловится в хендлерах отдельно, чтобы показать пользователю вежливое
+    сообщение вместо технической ошибки.
+    """
+
+
+# Коды/признаки, при которых виноват не наш код, а лимиты или перегрузка.
+_LIMIT_MARKERS = (
+    "429", "503",
+    "resource_exhausted", "resource exhausted",
+    "unavailable", "overloaded",
+    "quota", "rate limit", "rate_limit",
+    "too many requests",
+)
+
+
+def _is_limit_error(exc: Exception) -> bool:
+    """429/503 или текст ошибки о лимитах/перегрузке."""
+    # 1) структурные коды из SDK / HTTP
+    for attr in ("code", "status_code", "status"):
+        value = getattr(exc, attr, None)
+        if value in (429, 503) or str(value).upper() in (
+            "429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE",
+        ):
+            return True
+    # 2) текстовые признаки в сообщении
+    text = str(exc).lower()
+    return any(marker in text for marker in _LIMIT_MARKERS)
+
+
 class AsyncGeminiClient:
     """Обёртка над google-genai: история + текст + картинки."""
 
@@ -115,6 +147,11 @@ class AsyncGeminiClient:
                 config=config,
             )
         except Exception as exc:
+            # 429 (лимит бесплатного тарифа) и 503 (перегрузка) — не наш баг:
+            # отдаём отдельным исключением, чтобы хендлер вежливо ответил.
+            if _is_limit_error(exc):
+                logger.warning("Gemini: лимит/перегрузка — %s", exc)
+                raise GeminiLimitError(str(exc)) from exc
             logger.exception("ошибка Gemini")
             raise GeminiError(str(exc)) from exc
 
