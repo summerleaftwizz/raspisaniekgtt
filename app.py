@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import settings
 from db import dispose_db, init_db
-from handlers import admin, other, profile, schedule, start, teachers
+from handlers import admin, gemini, other, profile, schedule, start, teachers
 from services import reminders, watcher
 
 # APScheduler — периодическая проверка изменений расписания (замены/отмены).
@@ -44,6 +44,7 @@ async def main() -> None:
     
     dp = Dispatcher()
     dp.include_routers(
+        gemini.router,       # /gemini, текст и фото с памятью (FSM-состояние)
         other.router,        # до start: перехватывает g:/spec: в режиме «Другая группа»
         teachers.router,     # FSM поиска преподавателя
         start.router,
