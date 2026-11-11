@@ -122,13 +122,13 @@ def _clean_room(value: str) -> str:
 
 
 def _is_subject_like(value: str) -> bool:
-    """Похоже ли на название предмета, а не на кабинет/ФИО."""
+    """Похоже ли на название предмета, а не на кабинет/ФИО/номер."""
     value = _normalize_teacher(value)
     if not value or _is_fio(value):
         return False
     if any(ch.isdigit() for ch in value):
         return False
-    return " " in value or len(value) > 9
+    return True
 
 
 def _same_subject(a: str, b: str) -> bool:
@@ -207,15 +207,22 @@ def _read_sheet_grid(content: bytes, sheet_name: str) -> pd.DataFrame:
 def _parse_sheet_by_groups(
     df: pd.DataFrame, cfg: ParserConfig, content: bytes, sheet_name: str
 ) -> dict[str, list[Lesson]]:
-    """Якорный парсинг: у каждой группы свой блок столбцов справа.
+    """Якорный парсинг по координатам названий групп — БЕЗ ключевых слов.
 
-    Схема файла (подтверждена на реальных данных):
-      строка N:  1ИСИП-25-9 (J) | 1ОГР-25-9 (N) | 1ЭП-26-9 (S)
-      строка N+1: данные пар — по 3 столбца на группу:
-                  [предмет] [преподаватель] [кабинет]
-
-    Блок группы = от её столбца до столбца следующей группы (или конца листа).
-    Данные читаются ТОЛЬКО из этого блока — в столбцы соседей не залезаем.
+    Алгоритм:
+    1. Находим ВСЕ ячейки с названиями групп (regex-маска). В реальном файле
+       они раскиданы по нескольким строкам (блоки групп друг под другом) —
+       обрабатываем каждую строку-заголовок, а не только одну.
+    2. Для каждой группы её блок столбцов = от её столбца до столбца
+       следующей группы в той же строке (или до конца листа).
+    3. Данные читаем из строк ниже заголовка (до следующей строки-заголовка),
+       ТОЛЬКО из столбцов этого блока — в соседей не залезаем.
+    4. Номер пары: общий столбец с числами 1..12, иначе первый столбец блока.
+    5. Объединённые ячейки уже развёрнуты (_read_sheet_grid), но если ячейка
+       всё же пустая — подставляем предыдущее значение (пара «размазана»
+       по строкам, читается один раз).
+    6. Ошибка по одной группе (пустой блок) пишется в лог, остальные группы
+       обрабатываются дальше.
     """
     group_cells = _find_group_cells(df, cfg)
     if not group_cells:
@@ -224,77 +231,87 @@ def _parse_sheet_by_groups(
             % (sheet_name, cfg.GROUP_NAME_PATTERN)
         )
 
-    # Строка с названиями групп: та, где их больше всего.
+    # Группируем названия групп по строкам; сортируем строки сверху вниз.
     by_row: dict[int, list[tuple[int, str]]] = {}
     for r, c, name in group_cells:
         by_row.setdefault(r, []).append((c, name))
-    header_row = max(by_row, key=lambda k: len(by_row[k]))
-    cells = sorted(by_row[header_row], key=lambda x: x[0])
+    header_rows = sorted(by_row)
 
     ncols = df.shape[1]
+    nrows = len(df)
+    lesson_col = _find_lesson_col(df)
     groups: dict[str, list[Lesson]] = {}
 
-    for i, (sc, name) in enumerate(cells):
-        # Границы блока группы: до столбца следующей группы.
-        block_end = cells[i + 1][0] if i + 1 < len(cells) else ncols
-        block_cols = list(range(sc, block_end))
+    for hi, hr in enumerate(header_rows):
+        # Данные этого блока — до следующей строки-заголовка (или конца листа).
+        block_rows_end = header_rows[hi + 1] if hi + 1 < len(header_rows) else nrows
+        cells = sorted(by_row[hr], key=lambda x: x[0])
 
-        lessons: list[Lesson] = []
-        last_subject = ""
-        last_teacher = ""
-        last_room = ""
-        seen_numbers: set[int] = set()
-
-        for r in range(header_row + 1, len(df)):
-            # Номер пары — только в первом столбце блока группы.
-            lesson_number = _to_int(df.iat[r, sc])
-            if lesson_number is None or lesson_number in seen_numbers:
+        for i, (sc, name) in enumerate(cells):
+            # Столбцы блока группы: от sc до столбца следующей группы.
+            block_end = cells[i + 1][0] if i + 1 < len(cells) else ncols
+            block_cols = list(range(sc, block_end))
+            if not block_cols:
                 continue
-            seen_numbers.add(lesson_number)
 
-            # Читаем ровно три столбца блока: предмет, преподаватель, кабинет.
-            subject = _cell_to_str(df.iat[r, block_cols[0]]) if block_cols else ""
-            teacher = (
-                _normalize_teacher(_cell_to_str(df.iat[r, block_cols[1]]))
-                if len(block_cols) > 1 else ""
-            )
-            room = (
-                _clean_room(_cell_to_str(df.iat[r, block_cols[2]]))
-                if len(block_cols) > 2 else ""
-            )
+            lessons: list[Lesson] = []
+            seen_numbers: set[int] = set()
+            last_subject = last_teacher = last_room = ""
 
-            # Если ячейка пустая (не было merge) — берём предыдущее значение:
-            # так «размазанные» пары читаются один раз.
-            if not subject:
-                subject = last_subject
-            else:
-                last_subject = subject
-            if not teacher:
-                teacher = last_teacher
-            else:
-                last_teacher = teacher
-            if not room:
-                room = last_room
-            else:
-                last_room = room
+            for r in range(hr + 1, block_rows_end):
+                # Номер пары: общий столбец чисел, иначе первый столбец блока.
+                lesson_number = _to_int(df.iat[r, lesson_col])
+                if lesson_number is None:
+                    lesson_number = _to_int(df.iat[r, sc])
+                if lesson_number is None or lesson_number in seen_numbers:
+                    continue
+                seen_numbers.add(lesson_number)
 
-            lessons.append(
-                Lesson(
-                    lesson_number=lesson_number,
-                    time="",
-                    subject=subject,
-                    room=room,
-                    teacher=teacher,
-                    subgroups=[],
+                # Читаем блок: предмет — первый subject-like столбец,
+                # преподаватель — первое ФИО, кабинет — первая аудитория.
+                subject = teacher = room = ""
+                for c in block_cols:
+                    cell = _cell_to_str(df.iat[r, c])
+                    if not cell:
+                        continue
+                    if not subject and _is_subject_like(cell):
+                        subject = cell
+                    elif not teacher and _is_fio(cell):
+                        teacher = _normalize_teacher(cell)
+                    elif not room and not _is_fio(cell) and not _is_subject_like(cell):
+                        room = _clean_room(cell)
+
+                # Пустая ячейка (пара продолжается со строки выше) — берём
+                # предыдущее значение, чтобы пара не потерялась.
+                subject = subject or last_subject
+                teacher = teacher or last_teacher
+                room = room or last_room
+                last_subject, last_teacher, last_room = subject, teacher, room
+
+                lessons.append(
+                    Lesson(
+                        lesson_number=lesson_number,
+                        time="",
+                        subject=subject,
+                        room=room,
+                        teacher=teacher,
+                        subgroups=[],
+                    )
                 )
-            )
 
-        groups.setdefault(name, []).extend(lessons)
+            # Ошибка по одной группе не останавливает остальные.
+            if not lessons or not any(l.subject.strip() for l in lessons):
+                logger.error(
+                    "лист %s: у группы %s (столбец %d) нет заполненных пар — "
+                    "проверь структуру файла",
+                    sheet_name, name, sc + 1,
+                )
+            groups.setdefault(name, []).extend(lessons)
 
-    # Строгая проверка: если у ВСЕХ групп нет ни одного непустого предмета —
-    # это ошибка формата, а не «пустое расписание».
+    # Строгая проверка: если ни у одной группы нет ни одной заполненной пары —
+    # формат файла не распознан, сообщаем об ошибке.
     filled = [
-        l for lessons in groups.values() for l in lessons
+        l for ls in groups.values() for l in ls
         if l.subject.strip() and l.subject.strip().lower() not in {"окно", "-", "—"}
     ]
     if not filled:
@@ -495,10 +512,28 @@ def _parse_group_column(
     """Читает все пары группы из столбца sc (группы идут в строку)."""
     name = _cell_to_str(df.iat[header_row, sc])
     lessons: list[Lesson] = []
+    prev_number: Optional[int] = None
     for r in range(header_row + 1, len(df)):
         lesson_number = _to_int(df.iat[r, lesson_col])
         if lesson_number is None:
+            # Номера нет в общем столбце — ищем число 1..12 левее группы
+            # (у нижних блоков свой столбец номеров).
+            for c in range(0, sc):
+                v = _to_int(df.iat[r, c])
+                if v is not None and 1 <= v <= 12:
+                    lesson_number = v
+                    break
+        if lesson_number is None:
             continue  # строка с ФИО преподавателя или пустая
+        if lesson_number == prev_number:
+            # Merge-ячейка «размазала» пару на несколько строк с одним
+            # номером — читаем её один раз.
+            prev_lesson = lessons[-1] if lessons else None
+            if prev_lesson is not None and _cell_to_str(
+                df.iat[r, sc]
+            ) == prev_lesson.subject:
+                continue
+        prev_number = lesson_number
         room, teacher, subgroups = _read_pair(df, r, sc, next_sc, lesson_col, cfg)
         lessons.append(
             Lesson(
@@ -510,7 +545,20 @@ def _parse_group_column(
                 subgroups=subgroups,
             )
         )
-    return lessons
+    # Финальный дубль-фильтр: одинаковые подряд идущие пары (same number,
+    # subject, room, teacher) схлопываем в одну.
+    deduped: list[Lesson] = []
+    for l in lessons:
+        if (
+            deduped
+            and deduped[-1].lesson_number == l.lesson_number
+            and deduped[-1].subject == l.subject
+            and deduped[-1].room == l.room
+            and deduped[-1].teacher == l.teacher
+        ):
+            continue
+        deduped.append(l)
+    return deduped
 
 
 def _parse_group_row(
@@ -624,9 +672,10 @@ def _parse_sheet(df: pd.DataFrame, cfg: ParserConfig) -> dict[str, list[Lesson]]
 def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]:
     """Парсит xlsx. Возвращает {группа: [Lesson, ...]}.
 
-    Основной путь — якорный парсинг по координатам названий групп с
-    разворотом объединённых ячеек (_parse_sheet_by_groups). Если он не смог
-    разобрать лист, пробуем универсальный _parse_sheet.
+    Основной путь — универсальный якорный парсер (_parse_sheet) на сетке с
+    РАЗВЁРНУТЫМИ объединёнными ячейками: он поддерживает подгруппы, ФИО-строки
+    под парами и несколько блоков групп друг под другом. Резерв — plain-чтение
+    и блочный _parse_sheet_by_groups.
     """
     try:
         excel = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
@@ -637,14 +686,14 @@ def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]
     errors: list[str] = []
     for sheet_name in excel.sheet_names:
         sheet_groups: dict[str, list[Lesson]] = {}
-        # 1) основной путь: сетка с развёрнутыми merged-ячейками
+        # 1) основной путь: merge-развёрнутая сетка + универсальный парсер
         try:
             df_full = _read_sheet_grid(content, sheet_name)
-            sheet_groups = _parse_sheet_by_groups(df_full, cfg, content, sheet_name)
+            sheet_groups = _parse_sheet(df_full, cfg)
         except Exception as exc:
             errors.append(f"{sheet_name} (grid): {exc}")
             logger.warning("лист %s (grid) не распарсился: %s", sheet_name, exc)
-        # 2) резервный путь: обычное чтение pandas + универсальный разбор
+        # 2) резерв 1: обычное чтение pandas (без merge-развёртки)
         if not sheet_groups:
             try:
                 df_plain = pd.read_excel(
@@ -654,6 +703,14 @@ def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]
             except Exception as exc:
                 errors.append(f"{sheet_name} (plain): {exc}")
                 logger.warning("лист %s (plain) не распарсился: %s", sheet_name, exc)
+        # 3) резерв 2: строгий блочный разбор по трём столбцам на группу
+        if not sheet_groups:
+            try:
+                df_full = _read_sheet_grid(content, sheet_name)
+                sheet_groups = _parse_sheet_by_groups(df_full, cfg, content, sheet_name)
+            except Exception as exc:
+                errors.append(f"{sheet_name} (blocks): {exc}")
+                logger.warning("лист %s (blocks) не распарсился: %s", sheet_name, exc)
         for g, lessons in sheet_groups.items():
             groups.setdefault(g, []).extend(lessons)
 
