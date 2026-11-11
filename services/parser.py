@@ -96,9 +96,13 @@ def _is_group_name(value: str, cfg: ParserConfig) -> bool:
 
 
 # ФИО: «Кобзова С. В.», «Ощепкова А.С.», «Иванов Иван И.»
+# ВАЖНО: варианты взаимоисключающие — «Фамилия Имя И. В.» (4 токена) это
+# НЕ ФИО, а предмет с прилипшим ФИО (ловилось ранее → ФИО в subject).
 FIO_RE = re.compile(
-    r"^[А-ЯЁA-Z][а-яёa-z\-]+(?:\s+[А-ЯЁA-Z][а-яёa-z\-]+)?"
-    r"\s+[А-ЯЁA-Z]\.\s*[А-ЯЁA-Z]?\.?$"
+    r"^[А-ЯЁA-Z][а-яёa-z\-]+"
+    r"(?:\s+[А-ЯЁA-Z]\.\s*[А-ЯЁA-Z]?\.?"          # Фамилия И. О. / Фамилия И.
+    r"|\s+[А-ЯЁA-Z][а-яёa-z\-]+\s+[А-ЯЁA-Z]\.?)"  # Фамилия Имя И.
+    r"$"
 )
 # Аудитория: служебный префикс + номер («Ино 319» -> «319»)
 ROOM_NUMBER_RE = re.compile(r"\d+\s*[A-Za-zА-Яа-я]?")
@@ -107,6 +111,24 @@ ROOM_NUMBER_RE = re.compile(r"\d+\s*[A-Za-zА-Яа-я]?")
 def _is_fio(value: str) -> bool:
     """Похоже ли на ФИО в формате «Фамилия И. О.» (значение — из ячейки)."""
     return bool(FIO_RE.match(_normalize_teacher(value)))
+
+
+# ФИО в ХВОСТЕ строки: «История Иванова Е. В.» → предмет + ФИО
+FIO_TAIL_RE = re.compile(
+    r"[\s,;]+([А-ЯЁA-Z][а-яёa-z\-]+(?:\s+[А-ЯЁA-Z][а-яёa-z\-]+)?"
+    r"\s+[А-ЯЁA-Z]\.\s*[А-ЯЁA-Z]?\.?)\s*$"
+)
+
+
+def _split_subject_fio(value: str) -> tuple[str, str]:
+    """Отделяет ФИО от предмета в одной ячейке: «История Иванова Е. В.»
+    → («История», «Иванова Е. В.»). Если ФИО в хвосте нет — (текст, "")."""
+    s = _normalize_teacher(value)
+    m = FIO_TAIL_RE.search(s)
+    if not m:
+        return s, ""
+    subject_part = s[: m.start()].strip(" .,;:-")
+    return subject_part, m.group(1)
 
 
 def _clean_room(value: str) -> str:
@@ -327,16 +349,19 @@ def _parse_sheet_by_groups(
                     if _is_room_like(cell) and c != lesson_col:
                         if not room:
                             room = _clean_room(cell)
-                            logger.info(
-                                "кабинет найден: %s (лист %s, группа %s, строка %d)",
-                                room, sheet_name, name, r + 1,
-                            )
+                        continue
+                    if not teacher and _is_fio(cell):
+                        teacher = _normalize_teacher(cell)
                         continue
                     if not subject and _is_subject_like(cell):
-                        subject = cell
-                    elif not teacher and _is_fio(cell):
-                        teacher = _normalize_teacher(cell)
-                    elif not room and not _is_fio(cell) and not _is_subject_like(cell):
+                        # «История Иванова Е. В.» — предмет с прилипшим ФИО:
+                        # разделяем, чтобы ФИО не попало в предмет.
+                        subj_part, fio_part = _split_subject_fio(cell)
+                        subject = subj_part
+                        if fio_part and not teacher:
+                            teacher = fio_part
+                        continue
+                    if not room and not _is_fio(cell) and not _is_subject_like(cell):
                         room = _clean_room(cell)
 
                 # Кабинета нет в строке пары — ищем строкой ниже (под
@@ -364,6 +389,10 @@ def _parse_sheet_by_groups(
                 room = room or last_room
                 last_subject, last_teacher, last_room = subject, teacher, room
 
+                logger.info(
+                    "лист %s, %s, пара №%d: предмет: [%s], преподаватель: [%s], кабинет: [%s]",
+                    sheet_name, name, lesson_number, subject, teacher, room,
+                )
                 lessons.append(
                     Lesson(
                         lesson_number=lesson_number,
@@ -600,13 +629,20 @@ def _read_pair(
     lesson_col: int,
     cfg: ParserConfig,
     block_end: int = 0,
-) -> tuple[str, str, list]:
+) -> tuple[str, str, str, list]:
     """Читает одну пару (предмет, каб, преподаватель, подгруппы) из строки r.
 
     Якорь — колонка sc группы. Данные только из этой строки и колонки sc.
     block_end — граница блока по строкам (для поиска кабинета ниже).
+    Возвращает (subject, room, teacher, subgroups) — subject уже очищен
+    от прилипшего ФИО.
     """
     subject = _cell_to_str(df.iat[r, sc])
+    # «История Иванова Е. В.» в одной ячейке — отделяем ФИО от предмета,
+    # чтобы ФИО не дублировалось в предмете и преподавателе.
+    subj_part, fio_part = _split_subject_fio(subject)
+    subject = subj_part or subject
+    inline_teacher = fio_part
 
     # Подгруппы: сканируем ячейки справа от sc до границы следующей группы.
     stop_cols = frozenset(
@@ -640,7 +676,15 @@ def _read_pair(
                 "пара r=%d col=%d: кабинет найден строкой ниже: %r", r, sc, room
             )
 
-    return room, teacher, subgroups
+    # ФИО, прилипшее к предмету: преподаватель ещё не определён — подставляем.
+    if inline_teacher and not teacher:
+        teacher = inline_teacher
+
+    logger.info(
+        "пара (строка %d, столбец %d): предмет: [%s], преподаватель: [%s], кабинет: [%s]",
+        r + 1, sc + 1, subject, teacher, room,
+    )
+    return subject, room, teacher, subgroups
 
 
 def _parse_group_column(
@@ -690,7 +734,7 @@ def _parse_group_column(
             if prev_subject and cur_subject == prev_subject:
                 continue
         prev_number = lesson_number
-        room, teacher, subgroups = _read_pair(
+        subject, room, teacher, subgroups = _read_pair(
             df, r, sc, next_sc, lesson_col, cfg, block_end
         )
         if not room and _cell_to_str(df.iat[r, sc]):
@@ -704,7 +748,7 @@ def _parse_group_column(
             Lesson(
                 lesson_number=lesson_number,
                 time="",
-                subject=_cell_to_str(df.iat[r, sc]),
+                subject=subject,
                 room=room,
                 teacher=teacher,
                 subgroups=subgroups,
