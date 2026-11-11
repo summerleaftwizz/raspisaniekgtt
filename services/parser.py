@@ -309,20 +309,19 @@ def _parse_sheet_by_groups(
             groups.setdefault(name, []).extend(lessons)
 
     # Строгая проверка: если ни у одной группы нет ни одной заполненной пары —
-    # формат файла не распознан, сообщаем об ошибке.
+    # формат файла не распознан, возвращаем пустой результат (следующий
+    # резервный путь попробует иначе).
     filled = [
         l for ls in groups.values() for l in ls
         if l.subject.strip() and l.subject.strip().lower() not in {"окно", "-", "—"}
     ]
-    if not filled:
-        logger.error(
-            "лист %s: все пары пустые/«окно» у групп %s — проверь структуру файла",
+    if not filled and groups:
+        logger.warning(
+            "лист %s: все пары пустые/«окно» у групп %s — "
+            "пробуем другой метод парсинга",
             sheet_name, list(groups.keys()),
         )
-        raise ParseError(
-            "лист %s: не найдено ни одной заполненной пары у групп %s"
-            % (sheet_name, ", ".join(groups.keys()))
-        )
+        return {}
 
     return groups
 
@@ -508,12 +507,21 @@ def _parse_group_column(
     next_sc: int,
     lesson_col: int,
     cfg: ParserConfig,
+    *,
+    block_end: int = 0,
 ) -> list[Lesson]:
-    """Читает все пары группы из столбца sc (группы идут в строку)."""
+    """Читает все пары группы из столбца sc (группы идут в строку).
+
+    block_end — граница по строкам (строка следующего заголовка групп или
+    конец листа). Без неё парсер залезает в данные нижележащих блоков и
+    приписывает чужие пары к группе (баг «Химия вместо предметов»).
+    """
+    if block_end == 0:
+        block_end = len(df)
     name = _cell_to_str(df.iat[header_row, sc])
     lessons: list[Lesson] = []
     prev_number: Optional[int] = None
-    for r in range(header_row + 1, len(df)):
+    for r in range(header_row + 1, block_end):
         lesson_number = _to_int(df.iat[r, lesson_col])
         if lesson_number is None:
             # Номера нет в общем столбце — ищем число 1..12 левее группы
@@ -525,13 +533,13 @@ def _parse_group_column(
                     break
         if lesson_number is None:
             continue  # строка с ФИО преподавателя или пустая
+        # Пара «размазана» merge-ячейкой на 2+ строк с одним номером —
+        # добавляем только если предмет ИЗМЕНИЛСЯ (иная пара, а не дубль).
         if lesson_number == prev_number:
-            # Merge-ячейка «размазала» пару на несколько строк с одним
-            # номером — читаем её один раз.
             prev_lesson = lessons[-1] if lessons else None
-            if prev_lesson is not None and _cell_to_str(
-                df.iat[r, sc]
-            ) == prev_lesson.subject:
+            prev_subject = prev_lesson.subject if prev_lesson else ""
+            cur_subject = _cell_to_str(df.iat[r, sc])
+            if prev_subject and cur_subject == prev_subject:
                 continue
         prev_number = lesson_number
         room, teacher, subgroups = _read_pair(df, r, sc, next_sc, lesson_col, cfg)
@@ -642,15 +650,21 @@ def _parse_sheet(df: pd.DataFrame, cfg: ParserConfig) -> dict[str, list[Lesson]]
                 all_suspicious = False
     else:
         # Смешанная разметка: несколько строк с названиями групп — каждая строка
-        # — отдельный блок. Читаем как «группы в строке» для каждой такой строки.
+        # — отдельный блок. Границы блока — до следующей строки-заголовка,
+        # чтобы парсер не «подбирал» данные из нижних блоков.
         by_row: dict[int, list[tuple[int, str]]] = {}
-        for r, c, name in group_cells:
-            by_row.setdefault(r, []).append((c, name))
-        for r in sorted(by_row):
-            cells = sorted(by_row[r], key=lambda x: x[0])
+        for rc, cc, name in group_cells:
+            by_row.setdefault(rc, []).append((cc, name))
+        header_rows = sorted(by_row)
+        for hi, (hr, cells) in enumerate(
+            (hr, sorted(by_row[hr], key=lambda x: x[0])) for hr in header_rows
+        ):
+            block_end = header_rows[hi + 1] if hi + 1 < len(header_rows) else len(df)
             for i, (sc, name) in enumerate(cells):
                 next_sc = cells[i + 1][0] if i + 1 < len(cells) else ncols
-                lessons = _parse_group_column(df, r, sc, next_sc, lesson_col, cfg)
+                lessons = _parse_group_column(
+                    df, hr, sc, next_sc, lesson_col, cfg, block_end=block_end,
+                )
                 groups.setdefault(name, []).extend(lessons)
                 if lessons and any(l.subject or l.room or l.teacher for l in lessons):
                     all_suspicious = False
@@ -693,7 +707,17 @@ def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]
         except Exception as exc:
             errors.append(f"{sheet_name} (grid): {exc}")
             logger.warning("лист %s (grid) не распарсился: %s", sheet_name, exc)
-        # 2) резерв 1: обычное чтение pandas (без merge-развёртки)
+        # 2) резерв 1: строгий блочный разбор (по 3 столбца на группу).
+        #    Ставим его ПЕРЕД plain-pandas: он подходит для реальных файлов,
+        #    где у каждой группы предмет|ФИО|кабинет в соседних колонках.
+        if not sheet_groups:
+            try:
+                df_full = _read_sheet_grid(content, sheet_name)
+                sheet_groups = _parse_sheet_by_groups(df_full, cfg, content, sheet_name)
+            except Exception as exc:
+                errors.append(f"{sheet_name} (blocks): {exc}")
+                logger.warning("лист %s (blocks) не распарсился: %s", sheet_name, exc)
+        # 3) резерв 2: обычное чтение pandas (без merge-развёртки) + _parse_sheet
         if not sheet_groups:
             try:
                 df_plain = pd.read_excel(
