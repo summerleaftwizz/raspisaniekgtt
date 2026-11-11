@@ -181,14 +181,39 @@ def _find_lesson_col(df: pd.DataFrame) -> int:
 
 
 def _find_group_cells(df: pd.DataFrame, cfg: ParserConfig) -> list[tuple[int, int, str]]:
-    """Все ячейки, точно совпадающие с маской названия группы (row, col, name)."""
+    """Все ячейки, точно совпадающие с маской названия группы (row, col, name).
+
+    Объединённая ячейка с названием группы разворачивается на несколько
+    колонок/строк (_read_sheet_grid) — без дедупликации «ПРУМ-23» давал бы
+    блок 11..11, отрезая столбцы кабинетов 12–13. Оставляем только левую-
+    верхнюю (первую) ячейку каждой серии одинаковых соседних названий.
+    """
     cells: list[tuple[int, int, str]] = []
     for r in range(len(df)):
+        last_c: Optional[int] = None
+        last_name = ""
         for c in range(df.shape[1]):
             v = _cell_to_str(df.iat[r, c])
-            if _is_group_name(v, cfg):
-                cells.append((r, c, v))
-    return cells
+            if not _is_group_name(v, cfg):
+                continue
+            # Серия одинаковых названий в соседних колонках = один блок.
+            if last_c is not None and v == last_name and c - last_c <= 2:
+                continue
+            cells.append((r, c, v))
+            last_c, last_name = c, v
+    # Вертикальные merge: одинаковое название в соседних строках той же
+    # колонки — оставляем верхнюю ячейку.
+    dedup: list[tuple[int, int, str]] = []
+    for r, c, name in cells:
+        if (
+            dedup
+            and dedup[-1][1] == c
+            and dedup[-1][2] == name
+            and r - dedup[-1][0] <= 2
+        ):
+            continue
+        dedup.append((r, c, name))
+    return dedup
 
 
 # --------------------------------------------- чтение сетки с merge-ячейками ---
