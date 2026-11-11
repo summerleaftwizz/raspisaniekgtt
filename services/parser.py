@@ -131,6 +131,23 @@ def _is_subject_like(value: str) -> bool:
     return True
 
 
+def _is_room_like(value: str) -> bool:
+    """Явно похоже на аудиторию: только цифры («125», «310»), цифры + буква
+    («125а», «304л»), «каб. 125», «ауд. 310», «Ино 319».
+
+    Чистое число 1..12 НЕ считаем кабинетом — это может быть номер пары.
+    """
+    s = _normalize_teacher(value)
+    if not s:
+        return False
+    low = s.lower()
+    if low.startswith("каб") or low.startswith("ауд") or low.startswith("ино"):
+        return True
+    # только цифры (и, возможно, одна буква-суффикс): «125», «125а»
+    core = s[:-1] if s[-1:].isalpha() else s
+    return core.isdigit() and (len(core) > 2 or int(core) > 12)
+
+
 def _same_subject(a: str, b: str) -> bool:
     """Один и тот же предмет (подгруппы одного предмета пишут одинаково)."""
     a, b = _normalize_teacher(a).lower(), _normalize_teacher(b).lower()
@@ -264,19 +281,31 @@ def _parse_sheet_by_groups(
 
             for r in range(hr + 1, block_rows_end):
                 # Номер пары: общий столбец чисел, иначе первый столбец блока.
+                # Только 1..12: иначе ячейка кабинета «125» может быть
+                # ошибочно съедена как номер пары.
                 lesson_number = _to_int(df.iat[r, lesson_col])
-                if lesson_number is None:
+                if lesson_number is None or not 1 <= lesson_number <= 12:
                     lesson_number = _to_int(df.iat[r, sc])
+                if lesson_number is None or not 1 <= lesson_number <= 12:
+                    lesson_number = None
                 if lesson_number is None or lesson_number in seen_numbers:
                     continue
                 seen_numbers.add(lesson_number)
 
-                # Читаем блок: предмет — первый subject-like столбец,
-                # преподаватель — первое ФИО, кабинет — первая аудитория.
+                # Читаем блок: кабинет с ТОЛЬКО цифрами — первым приоритетом,
+                # затем предмет, преподаватель, кабинет прочий.
                 subject = teacher = room = ""
                 for c in block_cols:
                     cell = _cell_to_str(df.iat[r, c])
                     if not cell:
+                        continue
+                    if _is_room_like(cell) and c != lesson_col:
+                        if not room:
+                            room = _clean_room(cell)
+                            logger.info(
+                                "кабинет найден: %s (лист %s, группа %s, строка %d)",
+                                room, sheet_name, name, r + 1,
+                            )
                         continue
                     if not subject and _is_subject_like(cell):
                         subject = cell
@@ -352,7 +381,20 @@ def _parse_sheet_by_groups(
 
 
 def _find_room_right(df: pd.DataFrame, r: int, sc: int, boundary: int) -> str:
-    """Ближайшая ячейка справа от sc (до boundary), похожая на аудиторию."""
+    """Ближайшая ячейка справа от sc (до boundary), похожая на аудиторию.
+
+    Ячейки с ТОЛЬКО цифрами («125», «310») — это точно кабинет, берём их
+    в первую очередь, независимо от остальных проверок.
+    """
+    # Проход 1: явные кабинеты (только цифры / «каб. N») — высший приоритет.
+    for c in range(sc + 1, boundary):
+        cell = _cell_to_str(df.iat[r, c])
+        if cell and _is_room_like(cell):
+            room = _clean_room(cell)
+            if room:
+                logger.info("кабинет найден: %s (строка %d, столбец %d)", room, r + 1, c + 1)
+                return room
+    # Проход 2: остальное, что не ФИО и не предмет.
     for c in range(sc + 1, boundary):
         cell = _cell_to_str(df.iat[r, c])
         if not cell:
@@ -363,6 +405,7 @@ def _find_room_right(df: pd.DataFrame, r: int, sc: int, boundary: int) -> str:
             continue
         room = _clean_room(cell)
         if room:
+            logger.info("кабинет найден: %s (строка %d, столбец %d)", room, r + 1, c + 1)
             return room
     return ""
 
@@ -395,12 +438,22 @@ def _find_room_nearby(
         # строка с новым номером пары — это уже следующая пара, не лезем
         if lesson_col < df.shape[1] and _to_int(df.iat[rr, lesson_col]) is not None:
             continue
+        # проход 1: явные кабинеты (только цифры)
+        for c in range(sc, next_sc):
+            cell = _cell_to_str(df.iat[rr, c])
+            if cell and _is_room_like(cell):
+                room = _clean_room(cell)
+                if room:
+                    logger.info("кабинет найден: %s (строка ниже %d, столбец %d)", room, rr + 1, c + 1)
+                    return room
+        # проход 2: прочие кандидаты
         for c in range(sc, next_sc):
             cell = _cell_to_str(df.iat[rr, c])
             if not cell or _is_fio(cell) or _is_subject_like(cell):
                 continue
             room = _clean_room(cell)
             if room:
+                logger.info("кабинет найден: %s (строка ниже %d, столбец %d)", room, rr + 1, c + 1)
                 return room
     return ""
 
