@@ -253,6 +253,10 @@ def _parse_sheet_by_groups(
             block_cols = list(range(sc, block_end))
             if not block_cols:
                 continue
+            logger.info(
+                "лист %s, группа %s: блок столбцов %d..%d, строки %d..%d",
+                sheet_name, name, sc + 1, block_end, hr + 2, block_rows_end,
+            )
 
             lessons: list[Lesson] = []
             seen_numbers: set[int] = set()
@@ -280,6 +284,24 @@ def _parse_sheet_by_groups(
                         teacher = _normalize_teacher(cell)
                     elif not room and not _is_fio(cell) and not _is_subject_like(cell):
                         room = _clean_room(cell)
+
+                # Кабинета нет в строке пары — ищем строкой ниже (под
+                # предметом/преподавателем), в пределах блока.
+                if not room:
+                    room = _find_room_nearby(
+                        df, r, sc, block_end, block_rows_end, lesson_col
+                    )
+                    if room:
+                        logger.debug(
+                            "лист %s, %s: кабинет %r найден строкой ниже для r=%d",
+                            sheet_name, name, room, r + 1,
+                        )
+                    else:
+                        logger.info(
+                            "лист %s, %s: пара r=%d без кабинета; ячейки блока: %s",
+                            sheet_name, name, r + 1,
+                            [_cell_to_str(df.iat[r, c]) for c in block_cols],
+                        )
 
                 # Пустая ячейка (пара продолжается со строки выше) — берём
                 # предыдущее значение, чтобы пара не потерялась.
@@ -351,6 +373,36 @@ def _find_teacher_below(df: pd.DataFrame, r: int, sc: int) -> str:
         return ""
     cell = _cell_to_str(df.iat[r, sc])
     return _normalize_teacher(cell) if _is_fio(cell) else ""
+
+
+def _find_room_nearby(
+    df: pd.DataFrame, r: int, sc: int, next_sc: int, block_end: int,
+    lesson_col: int = 0,
+) -> str:
+    """Ищет аудиторию рядом с парой: строка r (справа от sc) и 2 строки ниже.
+
+    Нужно для файлов, где кабинет стоит НЕ в строке предмета, а строкой
+    ниже (под предметом) или в объединённой ячейке. Аудитория = ячейка
+    с цифрами, которая не ФИО и не предмет. Новую пару (число в колонке
+    номеров) не пересекаем.
+    """
+    # 1) та же строка, правее предмета
+    room = _find_room_right(df, r, sc, next_sc)
+    if room:
+        return room
+    # 2) строки ниже: r+1, r+2 — кабинет под предметом/преподавателем
+    for rr in range(r + 1, min(r + 3, block_end, len(df))):
+        # строка с новым номером пары — это уже следующая пара, не лезем
+        if lesson_col < df.shape[1] and _to_int(df.iat[rr, lesson_col]) is not None:
+            continue
+        for c in range(sc, next_sc):
+            cell = _cell_to_str(df.iat[rr, c])
+            if not cell or _is_fio(cell) or _is_subject_like(cell):
+                continue
+            room = _clean_room(cell)
+            if room:
+                return room
+    return ""
 
 
 def _extract_subgroups(
@@ -469,10 +521,12 @@ def _read_pair(
     next_sc: int,
     lesson_col: int,
     cfg: ParserConfig,
+    block_end: int = 0,
 ) -> tuple[str, str, list]:
     """Читает одну пару (предмет, каб, преподаватель, подгруппы) из строки r.
 
     Якорь — колонка sc группы. Данные только из этой строки и колонки sc.
+    block_end — граница блока по строкам (для поиска кабинета ниже).
     """
     subject = _cell_to_str(df.iat[r, sc])
 
@@ -497,6 +551,17 @@ def _read_pair(
         teacher = _find_teacher_below(df, r + 1, sc)
         subgroups = []
 
+    # Кабинета нет в строке пары — возможно, он строкой ниже (под предметом)
+    # или в объединённой ячейке. Ищем в окрестности пары.
+    if not room:
+        room = _find_room_nearby(
+            df, r, sc, next_sc, block_end or len(df), lesson_col
+        )
+        if room:
+            logger.debug(
+                "пара r=%d col=%d: кабинет найден строкой ниже: %r", r, sc, room
+            )
+
     return room, teacher, subgroups
 
 
@@ -519,6 +584,11 @@ def _parse_group_column(
     if block_end == 0:
         block_end = len(df)
     name = _cell_to_str(df.iat[header_row, sc])
+    logger.info(
+        "группа %s: строка заголовка %d, столбец %d, границы блока: "
+        "cols %d..%d, rows %d..%d",
+        name, header_row + 1, sc + 1, sc + 1, next_sc, header_row + 2, block_end,
+    )
     lessons: list[Lesson] = []
     prev_number: Optional[int] = None
     for r in range(header_row + 1, block_end):
@@ -542,7 +612,16 @@ def _parse_group_column(
             if prev_subject and cur_subject == prev_subject:
                 continue
         prev_number = lesson_number
-        room, teacher, subgroups = _read_pair(df, r, sc, next_sc, lesson_col, cfg)
+        room, teacher, subgroups = _read_pair(
+            df, r, sc, next_sc, lesson_col, cfg, block_end
+        )
+        if not room and _cell_to_str(df.iat[r, sc]):
+            logger.info(
+                "группа %s: пара r=%d (номер %d) — кабинет не найден; "
+                "ячейки блока cols %d..%d в строке: %s",
+                name, r + 1, lesson_number, sc + 1, next_sc,
+                [_cell_to_str(df.iat[r, c]) for c in range(sc, next_sc)],
+            )
         lessons.append(
             Lesson(
                 lesson_number=lesson_number,
