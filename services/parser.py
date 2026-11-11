@@ -143,19 +143,50 @@ def _clean_room(value: str) -> str:
     return m.group(0).strip() if m else s
 
 
+# Служебные слова шапки — их нельзя принять за предмет.
+HEADER_WORDS = frozenset(
+    {
+        "пара", "№", "номер", "номер пары", "время", "день", "дата",
+        "дисциплина", "предмет", "преподаватель", "учитель", "ауд",
+        "ауд.", "кабинет", "каб", "каб.", "группа", "расписание",
+    }
+)
+
+# Чистое число (номер пары/кабинета), а не текст предмета.
+NUMBER_ONLY_RE = re.compile(r"^\d{1,4}$")
+# Число с необязательной буквой-суффиксом: «125», «125а», «304 л».
+PURE_ROOM_RE = re.compile(r"^(\d{1,4})\s*([A-Za-zА-Яа-яЁё])?$")
+# Служебный префикс/слово аудитории в любом месте строки.
+ROOM_HINT_RE = re.compile(r"(?:^|\s)(?:каб\.?|ауд\.?|аудитор(?:ия)?|ино)", re.I)
+
+
+def _is_number_like(value: str) -> bool:
+    """Ячейка — просто число («125»), без букв."""
+    return bool(NUMBER_ONLY_RE.match(_normalize_teacher(value)))
+
+
+def _is_header_word(value: str) -> bool:
+    s = _normalize_teacher(value).strip(" .,:;-").lower()
+    return bool(s) and s in HEADER_WORDS
+
+
 def _is_subject_like(value: str) -> bool:
-    """Похоже ли на название предмета, а не на кабинет/ФИО/номер."""
+    """Похоже ли на название предмета, а не на кабинет/ФИО/номер/шапку.
+
+    Предмет — текст с буквами. Цифры внутри допустимы («1С: Бухгалтерия»,
+    «Основы 3D-моделирования»), но чистое число и явный кабинет — нет.
+    """
     value = _normalize_teacher(value)
-    if not value or _is_fio(value):
+    if not value or _is_fio(value) or _is_number_like(value):
         return False
-    if any(ch.isdigit() for ch in value):
+    if _is_room_like(value) or _is_header_word(value):
         return False
-    return True
+    return any(ch.isalpha() for ch in value)
 
 
 def _is_room_like(value: str) -> bool:
     """Явно похоже на аудиторию: только цифры («125», «310»), цифры + буква
-    («125а», «304л»), «каб. 125», «ауд. 310», «Ино 319».
+    («125а», «304л»), «каб. 125», «ауд. 310», «Ино 319», «max».
 
     Чистое число 1..12 НЕ считаем кабинетом — это может быть номер пары.
     """
@@ -163,11 +194,264 @@ def _is_room_like(value: str) -> bool:
     if not s:
         return False
     low = s.lower()
-    if low.startswith("каб") or low.startswith("ауд") or low.startswith("ино"):
+    if low in {"max", "макс"}:
         return True
-    # только цифры (и, возможно, одна буква-суффикс): «125», «125а»
-    core = s[:-1] if s[-1:].isalpha() else s
-    return core.isdigit() and (len(core) > 2 or int(core) > 12)
+    if ROOM_HINT_RE.search(low) and any(ch.isdigit() for ch in s):
+        return True
+    m = PURE_ROOM_RE.match(s)
+    if not m:
+        return False
+    digits = m.group(1)
+    return len(digits) > 2 or int(digits) > 12
+
+
+def _room_score(value: str) -> int:
+    """Насколько ячейка похожа на кабинет. Чем больше — тем вероятнее.
+
+    Приоритет: явный префикс «каб./ауд.» → трёхзначный номер → номер с
+    буквой. Нужен, чтобы при нескольких числах выбрать кабинет, а не
+    номер подгруппы/пары.
+    """
+    s = _normalize_teacher(value)
+    if not _is_room_like(s):
+        return -1
+    low = s.lower()
+    score = 0
+    if ROOM_HINT_RE.search(low):
+        score += 5
+    if low.startswith("ино"):
+        score += 1
+    m = re.search(r"\d{1,4}", s)
+    if m:
+        digits = m.group(0)
+        if len(digits) == 3:
+            score += 4
+        elif len(digits) == 2:
+            score += 2
+        elif len(digits) == 4:
+            score += 1
+    if re.search(r"\d\s*[A-Za-zА-Яа-яЁё]", s):
+        score += 1
+    return score
+
+
+def _pick_room(candidates: list[str]) -> str:
+    """Выбирает лучший кабинет из нескольких чисел/ячеек с цифрами."""
+    best, best_score = "", -1
+    for cell in candidates:
+        score = _room_score(cell)
+        if score > best_score:
+            best, best_score = _clean_room(cell), score
+    return best
+
+
+def _classify_values(
+    values, cfg: ParserConfig
+) -> tuple[str, str, str]:
+    """Классифицирует ячейки блока пары: (предмет, преподаватель, кабинет).
+
+    * ФИО читается только ОДИН раз — первая подходящая ячейка.
+    * Предмет — первый текст, который не ФИО и не число.
+    * Кабинет — лучший из чисел/«каб. N» (обычно трёхзначный).
+    """
+    subject = teacher = ""
+    room_candidates: list[str] = []
+
+    for _col, raw in values:
+        cell = _cell_to_str(raw)
+        if not cell:
+            continue
+        if _is_group_name(cell, cfg) or _is_header_word(cell):
+            continue
+        # 1) Преподаватель: только первое ФИО в блоке.
+        if _is_fio(cell):
+            if not teacher:
+                teacher = _normalize_teacher(cell)
+            continue
+        # 2) Кабинет: число / «каб. 310» / «Ино 319».
+        if _is_room_like(cell):
+            room_candidates.append(cell)
+            continue
+        # 3) Предмет, возможно с прилипшим ФИО в хвосте.
+        subj_part, fio_part = _split_subject_fio(cell)
+        if subj_part and _is_subject_like(subj_part):
+            if not subject:
+                subject = subj_part
+            if fio_part and not teacher:
+                teacher = fio_part
+            continue
+        if _is_subject_like(cell):
+            if not subject:
+                subject = cell
+            continue
+        # 4) Прочее с цифрами — потенциальный кабинет (выберем лучший).
+        if any(ch.isdigit() for ch in cell):
+            room_candidates.append(cell)
+
+    return subject, teacher, _pick_room(room_candidates)
+
+
+def _row_has_group_name(df: pd.DataFrame, r: int, cfg: ParserConfig) -> bool:
+    """Есть ли в строке название группы (значит, это шапка блока)."""
+    if not 0 <= r < len(df):
+        return False
+    for c in range(df.shape[1]):
+        if _is_group_name(_cell_to_str(df.iat[r, c]), cfg):
+            return True
+    return False
+
+
+def _classify_row(
+    df: pd.DataFrame,
+    r: int,
+    cols,
+    cfg: ParserConfig,
+    skip_cols: frozenset = frozenset(),
+) -> tuple[str, str, str]:
+    """Классифицирует все ячейки строки r в колонках cols."""
+    values = [
+        (c, df.iat[r, c])
+        for c in cols
+        if c not in skip_cols and 0 <= c < df.shape[1]
+    ]
+    return _classify_values(values, cfg)
+
+
+def _lesson_number_at(
+    df: pd.DataFrame, r: int, sc: int, lesson_col: int
+) -> Optional[int]:
+    """Номер пары в строке: общий столбец, затем число левее группы."""
+    if not 0 <= r < len(df):
+        return None
+    if 0 <= lesson_col < df.shape[1]:
+        v = _to_int(df.iat[r, lesson_col])
+        if v is not None and 1 <= v <= 12:
+            return v
+    for c in range(0, min(sc, df.shape[1])):
+        v = _to_int(df.iat[r, c])
+        if v is not None and 1 <= v <= 12:
+            return v
+    return None
+
+
+def _row_belongs_to_lesson(
+    df: pd.DataFrame,
+    r: int,
+    lesson_number: Optional[int],
+    sc: int,
+    lesson_col: int,
+) -> bool:
+    """Строка относится к той же паре (нет другого номера пары)."""
+    ln = _lesson_number_at(df, r, sc, lesson_col)
+    return ln is None or lesson_number is None or ln == lesson_number
+
+
+def _nearby_rows(
+    r: int, block_end: int, total_rows: int, *, below_first: bool = False
+):
+    """Соседние строки пары в разумном радиусе, без выхода за блок."""
+    above = [rr for rr in (r - 1, r - 2) if rr >= 0]
+    below = [rr for rr in (r + 1, r + 2, r + 3) if rr < min(block_end, total_rows)]
+    order = below + above if below_first else above + below
+    seen: set[int] = set()
+    for rr in order:
+        if rr != r and rr not in seen:
+            seen.add(rr)
+            yield rr
+
+
+def _find_subject_nearby(
+    df: pd.DataFrame,
+    r: int,
+    sc: int,
+    cols,
+    cfg: ParserConfig,
+    block_end: int,
+    lesson_col: int,
+    lesson_number: Optional[int],
+) -> str:
+    """Предмет из объединённой ячейки выше/ниже, если в строке его нет."""
+    for rr in _nearby_rows(r, block_end, len(df)):
+        if _row_has_group_name(df, rr, cfg):
+            continue
+        if not _row_belongs_to_lesson(df, rr, lesson_number, sc, lesson_col):
+            continue
+        subject, _teacher, _room = _classify_row(df, rr, cols, cfg)
+        if subject:
+            return subject
+    return ""
+
+
+def _find_teacher_nearby(
+    df: pd.DataFrame,
+    r: int,
+    sc: int,
+    cols,
+    cfg: ParserConfig,
+    block_end: int,
+    lesson_col: int,
+    lesson_number: Optional[int],
+) -> str:
+    """Первое ФИО из строки НИЖЕ той же пары (ФИО под предметом).
+
+    Выше не смотрим: там ФИО предыдущей пары, его нельзя приписывать
+    пустой строке (иначе преподаватель «дублируется» через пару).
+    """
+    for rr in range(r + 1, min(r + 4, block_end, len(df))):
+        if _row_has_group_name(df, rr, cfg):
+            continue
+        if not _row_belongs_to_lesson(df, rr, lesson_number, sc, lesson_col):
+            continue
+        _subject, teacher, _room = _classify_row(df, rr, cols, cfg)
+        if teacher:
+            return teacher
+    return ""
+
+
+def _find_room_nearby(
+    df: pd.DataFrame,
+    r: int,
+    sc: int,
+    next_sc: int,
+    block_end: int,
+    lesson_col: int = 0,
+    cfg: Optional[ParserConfig] = None,
+    lesson_number: Optional[int] = None,
+) -> str:
+    """Кабинет в соседней строке той же пары (обычно под предметом).
+
+    Аудитория = ячейка с цифрами, не ФИО и не предмет. Новую пару
+    (другой номер в столбце пар) не пересекаем.
+    """
+    cfg = cfg or ParserConfig()
+    cols = range(sc, next_sc)
+    for rr in _nearby_rows(r, block_end, len(df), below_first=True):
+        if _row_has_group_name(df, rr, cfg):
+            continue
+        if not _row_belongs_to_lesson(df, rr, lesson_number, sc, lesson_col):
+            continue
+        _subject, _teacher, room = _classify_row(df, rr, cols, cfg)
+        if room:
+            logger.info(
+                "кабинет найден: %s (строка %d, столбец блока %d)",
+                room, rr + 1, sc + 1,
+            )
+            return room
+    return ""
+
+
+def _merge_lesson(lesson: "Lesson", subject: str, teacher: str, room: str) -> None:
+    """Дополняет пару недостающими полями, не перезаписывая найденное.
+
+    Строки-продолжения (ФИО под предметом, объединённые ячейки) не должны
+    создавать вторую пару с тем же номером и затирать первую.
+    """
+    if not lesson.subject and _is_subject_like(subject):
+        lesson.subject = subject
+    if not lesson.teacher and teacher and _is_fio(teacher):
+        lesson.teacher = teacher
+    if not lesson.room and room and _is_room_like(room):
+        lesson.room = _clean_room(room)
 
 
 def _same_subject(a: str, b: str) -> bool:
@@ -324,85 +608,72 @@ def _parse_sheet_by_groups(
 
             lessons: list[Lesson] = []
             seen_numbers: set[int] = set()
-            last_subject = last_teacher = last_room = ""
+            prev_lesson: Optional[Lesson] = None
 
             for r in range(hr + 1, block_rows_end):
-                # Номер пары: общий столбец чисел, иначе первый столбец блока.
-                # Только 1..12: иначе ячейка кабинета «125» может быть
-                # ошибочно съедена как номер пары.
-                lesson_number = _to_int(df.iat[r, lesson_col])
-                if lesson_number is None or not 1 <= lesson_number <= 12:
-                    lesson_number = _to_int(df.iat[r, sc])
-                if lesson_number is None or not 1 <= lesson_number <= 12:
-                    lesson_number = None
-                if lesson_number is None or lesson_number in seen_numbers:
+                if _row_has_group_name(df, r, cfg):
+                    continue  # шапка следующего блока групп
+
+                lesson_number = _lesson_number_at(df, r, sc, lesson_col)
+
+                # Строка-продолжение без номера пары — дополняем предыдущую.
+                if lesson_number is None:
+                    if prev_lesson is not None:
+                        subject, teacher, room = _classify_row(
+                            df, r, block_cols, cfg,
+                            skip_cols=(
+                                frozenset({lesson_col}) if lesson_col != sc
+                                else frozenset()
+                            ),
+                        )
+                        _merge_lesson(prev_lesson, subject, teacher, room)
                     continue
-                seen_numbers.add(lesson_number)
 
-                # Читаем блок: кабинет с ТОЛЬКО цифрами — первым приоритетом,
-                # затем предмет, преподаватель, кабинет прочий.
-                subject = teacher = room = ""
-                for c in block_cols:
-                    cell = _cell_to_str(df.iat[r, c])
-                    if not cell:
-                        continue
-                    if _is_room_like(cell) and c != lesson_col:
-                        if not room:
-                            room = _clean_room(cell)
-                        continue
-                    if not teacher and _is_fio(cell):
-                        teacher = _normalize_teacher(cell)
-                        continue
-                    if not subject and _is_subject_like(cell):
-                        # «История Иванова Е. В.» — предмет с прилипшим ФИО:
-                        # разделяем, чтобы ФИО не попало в предмет.
-                        subj_part, fio_part = _split_subject_fio(cell)
-                        subject = subj_part
-                        if fio_part and not teacher:
-                            teacher = fio_part
-                        continue
-                    if not room and not _is_fio(cell) and not _is_subject_like(cell):
-                        room = _clean_room(cell)
-
-                # Кабинета нет в строке пары — ищем строкой ниже (под
-                # предметом/преподавателем), в пределах блока.
-                if not room:
-                    room = _find_room_nearby(
-                        df, r, sc, block_end, block_rows_end, lesson_col
+                # Такой номер уже был — это та же пара, размазанная merge-
+                # ячейкой на несколько строк. Не добавляем дубль (иначе
+                # вторая запись затирает первую и предмет становится ФИО).
+                if lesson_number in seen_numbers:
+                    subject, room, teacher, subgroups = _read_pair(
+                        df, r, sc, block_end, lesson_col, cfg, block_rows_end
                     )
-                    if room:
-                        logger.debug(
-                            "лист %s, %s: кабинет %r найден строкой ниже для r=%d",
-                            sheet_name, name, room, r + 1,
+                    target = prev_lesson
+                    if target is None or target.lesson_number != lesson_number:
+                        target = next(
+                            (l for l in reversed(lessons)
+                             if l.lesson_number == lesson_number),
+                            None,
                         )
-                    else:
-                        logger.info(
-                            "лист %s, %s: пара r=%d без кабинета; ячейки блока: %s",
-                            sheet_name, name, r + 1,
-                            [_cell_to_str(df.iat[r, c]) for c in block_cols],
-                        )
+                    if target is not None:
+                        _merge_lesson(target, subject, teacher, room)
+                        if subgroups and not target.subgroups:
+                            target.subgroups = subgroups
+                    continue
 
-                # Пустая ячейка (пара продолжается со строки выше) — берём
-                # предыдущее значение, чтобы пара не потерялась.
-                subject = subject or last_subject
-                teacher = teacher or last_teacher
-                room = room or last_room
-                last_subject, last_teacher, last_room = subject, teacher, room
+                seen_numbers.add(lesson_number)
+                subject, room, teacher, subgroups = _read_pair(
+                    df, r, sc, block_end, lesson_col, cfg, block_rows_end
+                )
+                if not room:
+                    logger.info(
+                        "лист %s, %s: пара r=%d без кабинета; ячейки блока: %s",
+                        sheet_name, name, r + 1,
+                        [_cell_to_str(df.iat[r, c]) for c in block_cols],
+                    )
 
                 logger.info(
                     "лист %s, %s, пара №%d: предмет: [%s], преподаватель: [%s], кабинет: [%s]",
                     sheet_name, name, lesson_number, subject, teacher, room,
                 )
-                lessons.append(
-                    Lesson(
-                        lesson_number=lesson_number,
-                        time="",
-                        subject=subject,
-                        room=room,
-                        teacher=teacher,
-                        subgroups=[],
-                    )
+                lesson = Lesson(
+                    lesson_number=lesson_number,
+                    time="",
+                    subject=subject,
+                    room=room,
+                    teacher=teacher,
+                    subgroups=subgroups,
                 )
+                lessons.append(lesson)
+                prev_lesson = lesson
 
             # Ошибка по одной группе не останавливает остальные.
             if not lessons or not any(l.subject.strip() for l in lessons):
@@ -470,46 +741,6 @@ def _find_teacher_below(df: pd.DataFrame, r: int, sc: int) -> str:
         return ""
     cell = _cell_to_str(df.iat[r, sc])
     return _normalize_teacher(cell) if _is_fio(cell) else ""
-
-
-def _find_room_nearby(
-    df: pd.DataFrame, r: int, sc: int, next_sc: int, block_end: int,
-    lesson_col: int = 0,
-) -> str:
-    """Ищет аудиторию рядом с парой: строка r (справа от sc) и 2 строки ниже.
-
-    Нужно для файлов, где кабинет стоит НЕ в строке предмета, а строкой
-    ниже (под предметом) или в объединённой ячейке. Аудитория = ячейка
-    с цифрами, которая не ФИО и не предмет. Новую пару (число в колонке
-    номеров) не пересекаем.
-    """
-    # 1) та же строка, правее предмета
-    room = _find_room_right(df, r, sc, next_sc)
-    if room:
-        return room
-    # 2) строки ниже: r+1, r+2 — кабинет под предметом/преподавателем
-    for rr in range(r + 1, min(r + 3, block_end, len(df))):
-        # строка с новым номером пары — это уже следующая пара, не лезем
-        if lesson_col < df.shape[1] and _to_int(df.iat[rr, lesson_col]) is not None:
-            continue
-        # проход 1: явные кабинеты (только цифры)
-        for c in range(sc, next_sc):
-            cell = _cell_to_str(df.iat[rr, c])
-            if cell and _is_room_like(cell):
-                room = _clean_room(cell)
-                if room:
-                    logger.info("кабинет найден: %s (строка ниже %d, столбец %d)", room, rr + 1, c + 1)
-                    return room
-        # проход 2: прочие кандидаты
-        for c in range(sc, next_sc):
-            cell = _cell_to_str(df.iat[rr, c])
-            if not cell or _is_fio(cell) or _is_subject_like(cell):
-                continue
-            room = _clean_room(cell)
-            if room:
-                logger.info("кабинет найден: %s (строка ниже %d, столбец %d)", room, rr + 1, c + 1)
-                return room
-    return ""
 
 
 def _extract_subgroups(
@@ -632,53 +863,66 @@ def _read_pair(
 ) -> tuple[str, str, str, list]:
     """Читает одну пару (предмет, каб, преподаватель, подгруппы) из строки r.
 
-    Якорь — колонка sc группы. Данные только из этой строки и колонки sc.
-    block_end — граница блока по строкам (для поиска кабинета ниже).
-    Возвращает (subject, room, teacher, subgroups) — subject уже очищен
-    от прилипшего ФИО.
-    """
-    subject = _cell_to_str(df.iat[r, sc])
-    # «История Иванова Е. В.» в одной ячейке — отделяем ФИО от предмета,
-    # чтобы ФИО не дублировалось в предмете и преподавателе.
-    subj_part, fio_part = _split_subject_fio(subject)
-    subject = subj_part or subject
-    inline_teacher = fio_part
+    Читаем ВЕСЬ блок группы (sc..next_sc), а не только колонку-якорь:
+    * предмет — первый текст, который не ФИО и не число;
+    * преподаватель — только первое ФИО в блоке (остальные игнорируются);
+    * кабинет — лучший из чисел/«каб. N» (обычно трёхзначный).
 
-    # Подгруппы: сканируем ячейки справа от sc до границы следующей группы.
+    Если поле пустое — ищем его в объединённой ячейке соседней строки
+    той же пары (предмет выше/ниже, ФИО под предметом, кабинет рядом).
+    Возвращает (subject, room, teacher, subgroups).
+    """
+    block_end = block_end or len(df)
+    next_sc = min(max(next_sc, sc + 1), df.shape[1])
+    cols = list(range(sc, next_sc))
+    # Столбец номеров пар — не предмет и не кабинет.
+    skip_cols = frozenset({lesson_col}) if lesson_col != sc else frozenset()
+    lesson_number = _lesson_number_at(df, r, sc, lesson_col)
+
+    subject, teacher, room = _classify_row(
+        df, r, cols, cfg, skip_cols=skip_cols
+    )
+
+    # Подгруппы: ячейки справа от sc до границы следующей группы.
     stop_cols = frozenset(
-        c for c in range(sc + 1, next_sc) if _is_group_name(_cell_to_str(df.iat[r, c]), cfg)
+        c for c in range(sc + 1, next_sc)
+        if _is_group_name(_cell_to_str(df.iat[r, c]), cfg)
     )
     subgroups = _extract_subgroups(
-        df, r, sc, len(df), lesson_col, cfg,
+        df, r, sc, block_end, lesson_col, cfg,
         stop_cols=stop_cols, main_subject=subject, col_limit=next_sc,
     )
+    if subgroups:
+        # Для разбивки на подгруппы основная пара = данные первой подгруппы,
+        # но предмет берём из классификации (ФИО им быть не может).
+        if subgroups[0].room:
+            room = subgroups[0].room
+        if subgroups[0].teacher:
+            teacher = subgroups[0].teacher
+        if len(subgroups) == 1:
+            subgroups = []
 
-    if len(subgroups) >= 2:
-        room = subgroups[0].room or ""
-        teacher = subgroups[0].teacher or ""
-    elif len(subgroups) == 1:
-        room = subgroups[0].room or ""
-        teacher = subgroups[0].teacher or ""
-        subgroups = []
-    else:
-        room = _find_room_right(df, r, sc, next_sc)
-        teacher = _find_teacher_below(df, r + 1, sc)
-        subgroups = []
-
-    # Кабинета нет в строке пары — возможно, он строкой ниже (под предметом)
-    # или в объединённой ячейке. Ищем в окрестности пары.
+    # Пустые поля — ищем в соседних строках той же пары.
+    if not subject:
+        subject = _find_subject_nearby(
+            df, r, sc, cols, cfg, block_end, lesson_col, lesson_number
+        )
+    if not teacher:
+        teacher = _find_teacher_nearby(
+            df, r, sc, cols, cfg, block_end, lesson_col, lesson_number
+        )
     if not room:
         room = _find_room_nearby(
-            df, r, sc, next_sc, block_end or len(df), lesson_col
+            df, r, sc, next_sc, block_end, lesson_col, cfg, lesson_number
         )
-        if room:
-            logger.debug(
-                "пара r=%d col=%d: кабинет найден строкой ниже: %r", r, sc, room
-            )
 
-    # ФИО, прилипшее к предмету: преподаватель ещё не определён — подставляем.
-    if inline_teacher and not teacher:
-        teacher = inline_teacher
+    # Защита от главного бага: ФИО/число/кабинет не могут быть предметом.
+    if subject and (
+        _is_fio(subject) or _is_number_like(subject) or _is_room_like(subject)
+    ):
+        subject = ""
+    if subject and teacher and _normalize_teacher(subject) == _normalize_teacher(teacher):
+        subject = ""
 
     logger.info(
         "пара (строка %d, столбец %d): предмет: [%s], преподаватель: [%s], кабинет: [%s]",
@@ -712,28 +956,38 @@ def _parse_group_column(
         name, header_row + 1, sc + 1, sc + 1, next_sc, header_row + 2, block_end,
     )
     lessons: list[Lesson] = []
-    prev_number: Optional[int] = None
+    prev_lesson: Optional[Lesson] = None
     for r in range(header_row + 1, block_end):
-        lesson_number = _to_int(df.iat[r, lesson_col])
+        if _row_has_group_name(df, r, cfg):
+            continue  # следующая шапка блока / название другой группы
+
+        lesson_number = _lesson_number_at(df, r, sc, lesson_col)
+        cols = list(range(sc, min(next_sc, df.shape[1])))
+
+        # Строка без номера пары — продолжение предыдущей пары
+        # (ФИО под предметом, объединённая ячейка). Не создаём новую пару,
+        # только дополняем недостающие поля.
         if lesson_number is None:
-            # Номера нет в общем столбце — ищем число 1..12 левее группы
-            # (у нижних блоков свой столбец номеров).
-            for c in range(0, sc):
-                v = _to_int(df.iat[r, c])
-                if v is not None and 1 <= v <= 12:
-                    lesson_number = v
-                    break
-        if lesson_number is None:
-            continue  # строка с ФИО преподавателя или пустая
-        # Пара «размазана» merge-ячейкой на 2+ строк с одним номером —
-        # добавляем только если предмет ИЗМЕНИЛСЯ (иная пара, а не дубль).
-        if lesson_number == prev_number:
-            prev_lesson = lessons[-1] if lessons else None
-            prev_subject = prev_lesson.subject if prev_lesson else ""
-            cur_subject = _cell_to_str(df.iat[r, sc])
-            if prev_subject and cur_subject == prev_subject:
-                continue
-        prev_number = lesson_number
+            if prev_lesson is not None:
+                subject, teacher, room = _classify_row(
+                    df, r, cols, cfg,
+                    skip_cols=frozenset({lesson_col}) if lesson_col != sc else frozenset(),
+                )
+                _merge_lesson(prev_lesson, subject, teacher, room)
+            continue
+
+        # Тот же номер пары = та же пара, «размазанная» merge-ячейкой на
+        # несколько строк (например, ФИО преподавателя). Вторую пару НЕ
+        # добавляем — иначе она затрёт первую в выводе (баг: предмет = ФИО).
+        if prev_lesson is not None and lesson_number == prev_lesson.lesson_number:
+            subject, room, teacher, subgroups = _read_pair(
+                df, r, sc, next_sc, lesson_col, cfg, block_end
+            )
+            _merge_lesson(prev_lesson, subject, teacher, room)
+            if subgroups and not prev_lesson.subgroups:
+                prev_lesson.subgroups = subgroups
+            continue
+
         subject, room, teacher, subgroups = _read_pair(
             df, r, sc, next_sc, lesson_col, cfg, block_end
         )
@@ -744,30 +998,17 @@ def _parse_group_column(
                 name, r + 1, lesson_number, sc + 1, next_sc,
                 [_cell_to_str(df.iat[r, c]) for c in range(sc, next_sc)],
             )
-        lessons.append(
-            Lesson(
-                lesson_number=lesson_number,
-                time="",
-                subject=subject,
-                room=room,
-                teacher=teacher,
-                subgroups=subgroups,
-            )
+        lesson = Lesson(
+            lesson_number=lesson_number,
+            time="",
+            subject=subject,
+            room=room,
+            teacher=teacher,
+            subgroups=subgroups,
         )
-    # Финальный дубль-фильтр: одинаковые подряд идущие пары (same number,
-    # subject, room, teacher) схлопываем в одну.
-    deduped: list[Lesson] = []
-    for l in lessons:
-        if (
-            deduped
-            and deduped[-1].lesson_number == l.lesson_number
-            and deduped[-1].subject == l.subject
-            and deduped[-1].room == l.room
-            and deduped[-1].teacher == l.teacher
-        ):
-            continue
-        deduped.append(l)
-    return deduped
+        lessons.append(lesson)
+        prev_lesson = lesson
+    return lessons
 
 
 def _parse_group_row(

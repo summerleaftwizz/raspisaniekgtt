@@ -56,6 +56,114 @@ def test_parse_horizontal_groups():
     assert g2[2].teacher == ""
 
 
+def make_merged_teacher_xlsx() -> bytes:
+    """Реальный проблемный формат: у группы 3 колонки
+    «Дисциплина | Преподаватель | Ауд.», ФИО стоит строкой ниже и
+    объединено на 2 строки, номер пары тоже объединён (1, 1, 1).
+
+    Ранее строка-продолжение с ФИО парсилась как отдельная пара и
+    затирала нормальную: предмет становился ФИО, кабинет терялся.
+    """
+    import openpyxl
+
+    buf = io.BytesIO()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Понедельник"
+    ws.append([
+        "Пара", "Дисциплина", "Преподаватель", "Ауд.",
+        "Дисциплина", "Преподаватель", "Ауд.",
+        "Дисциплина", "Преподаватель", "Ауд.",
+    ])
+
+    groups = [
+        (2, "1ИСИП-25-9", "История", "Савкина А. А.", "310"),
+        (5, "2ИСИП-25-9", "Математика", "Иванов И. И.", "205"),
+        (8, "3ИСИП-25-9", "Физика", "Петров П. П.", "301"),
+    ]
+    for col, name, subject, teacher, room in groups:
+        ws.cell(row=2, column=col, value=name)
+        ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + 2)
+        ws.cell(row=3, column=col, value=subject)
+        ws.cell(row=3, column=col + 2, value=room)
+        ws.cell(row=4, column=col + 1, value=teacher)
+        # ФИО преподавателя занимает 2 строки.
+        ws.merge_cells(start_row=4, start_column=col + 1, end_row=5, end_column=col + 1)
+
+    # Номер пары объединён на строку предмета + две строки преподавателя.
+    ws.cell(row=3, column=1, value=1)
+    ws.merge_cells(start_row=3, start_column=1, end_row=5, end_column=1)
+
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_merged_teacher_rows_do_not_overwrite_pair():
+    """Регрессия: у ВСЕХ групп есть предмет, ОДИН преподаватель и кабинет."""
+    from services.parser import _is_fio
+
+    groups = parse_schedule(make_merged_teacher_xlsx(), settings.parser)
+    assert set(groups.keys()) == {"1ИСИП-25-9", "2ИСИП-25-9", "3ИСИП-25-9"}
+
+    expected = {
+        "1ИСИП-25-9": ("История", "Савкина А. А.", "310"),
+        "2ИСИП-25-9": ("Математика", "Иванов И. И.", "205"),
+        "3ИСИП-25-9": ("Физика", "Петров П. П.", "301"),
+    }
+    for name, (subject, teacher, room) in expected.items():
+        lessons = groups[name]
+        assert len(lessons) == 1, [(l.lesson_number, l.subject, l.teacher, l.room) for l in lessons]
+        lesson = lessons[0]
+        assert lesson.lesson_number == 1
+        assert lesson.subject == subject
+        assert lesson.subject and not _is_fio(lesson.subject)
+        assert lesson.teacher == teacher
+        assert lesson.room == room
+
+
+def test_block_parser_fills_all_fields_for_every_group():
+    """Резервный блочный парсер тоже даёт предмет + преподавателя + кабинет."""
+    from services.parser import _parse_sheet_by_groups, _read_sheet_grid
+
+    content = make_merged_teacher_xlsx()
+    df = _read_sheet_grid(content, "Понедельник")
+    groups = _parse_sheet_by_groups(df, settings.parser, content, "Понедельник")
+
+    assert set(groups.keys()) == {"1ИСИП-25-9", "2ИСИП-25-9", "3ИСИП-25-9"}
+    for name, lessons in groups.items():
+        assert len(lessons) == 1, name
+        lesson = lessons[0]
+        assert lesson.subject, (name, "нет предмета")
+        assert lesson.teacher, (name, "нет преподавателя")
+        assert lesson.room, (name, "нет кабинета")
+
+
+def test_classify_takes_first_fio_and_best_room():
+    """Несколько ФИО и чисел: преподаватель — первое ФИО, кабинет — 3 цифры."""
+    from services.parser import ParserConfig, _classify_values
+
+    subject, teacher, room = _classify_values(
+        [
+            (1, "История"),
+            (2, "Савкина А. А."),
+            (3, "Петрова А. Б."),
+            (4, "1"),
+            (5, "125"),
+            (6, "каб. 310"),
+        ],
+        ParserConfig(),
+    )
+    assert subject == "История"
+    assert teacher == "Савкина А. А."  # только первое ФИО
+    assert room == "310"                # приоритет явного «каб. 310»
+
+    # Предмет с цифрами — всё ещё предмет, а не кабинет.
+    subject, _teacher, _room = _classify_values(
+        [(1, "1С: Бухгалтерия")], ParserConfig()
+    )
+    assert subject == "1С: Бухгалтерия"
+
+
 def test_normalize_teacher():
     assert _normalize_teacher("Иванов   И.  И.") == "Иванов И. И."
     assert _normalize_teacher("Петров\nП. П.\n") == "Петров П. П."
