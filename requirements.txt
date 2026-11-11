@@ -7,5 +7,4 @@ asyncpg>=0.29
 aiosqlite>=0.20
 python-dotenv>=1.0
 APScheduler>=3.10,<4
-google-genai>=0.3
 pytest>=8.0

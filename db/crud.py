@@ -371,38 +371,3 @@ async def claim_due_deadlines(session: AsyncSession, now_ts: int) -> list[models
         d.notified = True
     await session.flush()
     return due
-
-
-# --------------------------------------------------- история диалога Gemini ---
-
-
-async def add_history(
-    session: AsyncSession, user_id: int, role: str, content: str
-) -> None:
-    """Добавляет сообщение в историю диалога с Gemini."""
-    session.add(
-        models.GeminiHistory(
-            user_id=user_id, role=role, content=(content or "")[:4096]
-        )
-    )
-    await session.flush()
-
-
-async def get_history(
-    session: AsyncSession, user_id: int, limit: int = 10
-) -> list[models.GeminiHistory]:
-    """Последние `limit` сообщений пользователя — в хронологическом порядке."""
-    res = await session.execute(
-        select(models.GeminiHistory)
-        .where(models.GeminiHistory.user_id == user_id)
-        .order_by(models.GeminiHistory.id.desc())
-        .limit(limit)
-    )
-    return list(reversed(list(res.scalars())))
-
-
-async def clear_history(session: AsyncSession, user_id: int) -> None:
-    """Очищает историю диалога пользователя (команда /gemini_reset)."""
-    await session.execute(
-        delete(models.GeminiHistory).where(models.GeminiHistory.user_id == user_id)
-    )

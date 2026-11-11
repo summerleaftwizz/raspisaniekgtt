@@ -1,22 +1,22 @@
-"""Парсер Excel-расписания (реальный формат колледжа).
+"""Парсер Excel-расписания (якорный подход по точным координатам группы).
 
-Формат файла (проверено на реальных данных):
-  * один .xlsx = одна дата; лист(ы) называются по дню недели;
-  * группы идут горизонтальными блоками (по несколько в ряд), а блоки —
-    друг под другом:
-        Пара | Дисциплина (гр.1) ... | Ауд. (гр.1) ... | Дисциплина (гр.2) ...
-        №    | Преподаватель        |                 | ...
-             | 1  2  3 (подгруппы)  |                 | ...
-             | 1ОГР-26-9 | ...      |                 | ...
-        1    | История  | ...       | 304 | ...       | ...
-        2    | ...      | ...       | ... | ...       | ...
-  * колонка 0 = номер пары; строки с ФИО преподавателя чередуются со строками
-    пар и пропускаются (в колонке 0 пусто);
-  * у каждой группы две колонки: предмет (заголовок «Дисциплина»/«Предмет»)
-    и кабинет (заголовок «Ауд.»/«Кабинет»).
+Принцип — никаких поисков по ключевым словам («Дисциплина», «Предмет» и т.п.):
+1. Читаем Excel с header=None («сырая» сетка).
+2. Ищем ячейку, точно совпадающую с маской названия группы
+   (например, «1ОГР-25-9»). Запоминаем её координаты (row, col).
+3. Ориентация:
+   * группы идут в строку (одинаковый row) → данные берём из столбца группы,
+     читая вниз;
+   * группы идут в столбик (одинаковый col) → данные берём из строки группы,
+     читая вправо.
+4. Номер пары — это колонка, где больше всего целых чисел 1..12 (ищем без
+   ключевых слов).
+5. Преподаватель под предметом — обычный учитель пары, а не «1 п/г». Подгруппы
+   — только если явно есть вторая ячейка с тем же предметом / вторая аудитория
+   в той же строке.
 
-Колонки находятся по синонимам из config.ParserConfig, названия групп — по
-regex GROUP_NAME_PATTERN.
+Если группа не найдена или данные выглядят подозрительно (все пары «окно» /
+пустые) — ошибка в лог, а не молча пустое расписание.
 """
 import io
 import json
@@ -56,6 +56,9 @@ class Lesson:
     subgroups: list = field(default_factory=list)
 
 
+# ------------------------------------------------------- низкоуровневые ----
+
+
 def _cell_to_str(value) -> str:
     if value is None:
         return ""
@@ -88,54 +91,6 @@ def _normalize_teacher(value) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _matches_synonym(value: str, synonyms: tuple) -> bool:
-    for syn in synonyms:
-        if value == syn:
-            return True
-    for syn in synonyms:
-        if syn and syn in value:
-            return True
-    return False
-
-
-def _find_columns(df: pd.DataFrame, cfg: ParserConfig) -> tuple[int, list[int], list[int]]:
-    """Возвращает (колонка номера пары, [колонки предметов], [колонки кабинетов])."""
-    ncols = df.shape[1]
-    scan = min(cfg.HEADER_SCAN_ROWS, len(df))
-    lesson_col: Optional[int] = None
-    subject_cols: list[int] = []
-    room_cols: list[int] = []
-
-    for r in range(scan):
-        for c in range(ncols):
-            v = _cell_to_str(df.iat[r, c]).lower()
-            if not v:
-                continue
-            if lesson_col is None and _matches_synonym(v, cfg.LESSON_NUM_SYNONYMS):
-                lesson_col = c
-            if _matches_synonym(v, cfg.SUBJECT_SYNONYMS) and c not in subject_cols:
-                subject_cols.append(c)
-            if _matches_synonym(v, cfg.ROOM_SYNONYMS) and c not in room_cols:
-                room_cols.append(c)
-
-    subject_cols.sort()
-    room_cols.sort()
-
-    if lesson_col is None:
-        lesson_col = 0
-
-    if not subject_cols:
-        # фолбэк: колонки заданы индексами в config
-        if isinstance(cfg.COL_SUBJECT, int):
-            lesson_col = cfg.COL_LESSON_NUM if isinstance(cfg.COL_LESSON_NUM, int) else 0
-            subject_cols = [cfg.COL_SUBJECT]
-            room_cols = [cfg.COL_ROOM] if isinstance(cfg.COL_ROOM, int) else []
-        else:
-            raise ParseError("не найдены колонки предмета (Дисциплина/Предмет)")
-
-    return lesson_col, subject_cols, room_cols
-
-
 def _is_group_name(value: str, cfg: ParserConfig) -> bool:
     return bool(value) and re.match(cfg.GROUP_NAME_PATTERN, value) is not None
 
@@ -166,22 +121,8 @@ def _clean_room(value: str) -> str:
     return m.group(0).strip() if m else s
 
 
-def _looks_like_data(value: str) -> bool:
-    """Ячейка похожа на данные пары (аудитория с цифрами или ФИО),
-    а не на название чужого предмета («Химия», «Математика»)."""
-    if not value:
-        return False
-    if _is_fio(value):
-        return True
-    return any(ch.isdigit() for ch in value)
-
-
 def _is_subject_like(value: str) -> bool:
-    """Похоже ли на название предмета, а не на кабинет/ФИО.
-
-    «Иностранный язык», «Физическая культура» — да; «121», «Ино 319»,
-    «Кобзова С. В.» — нет.
-    """
+    """Похоже ли на название предмета, а не на кабинет/ФИО."""
     value = _normalize_teacher(value)
     if not value or _is_fio(value):
         return False
@@ -198,34 +139,220 @@ def _same_subject(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
+# ------------------------------------------------------ поиск колонки пары ----
+
+
+def _find_lesson_col(df: pd.DataFrame) -> int:
+    """Колонка с номерами пар: та, где больше всего целых чисел 1..12.
+
+    Ищем без ключевых слов — только по содержимому ячеек.
+    """
+    best_col, best_score = 0, 0
+    nrows = len(df)
+    for c in range(df.shape[1]):
+        score = 0
+        for r in range(nrows):
+            v = _to_int(df.iat[r, c])
+            if v is not None and 1 <= v <= 12:
+                score += 1
+        if score > best_score:
+            best_col, best_score = c, score
+    return best_col if best_score > 0 else 0
+
+
+# --------------------------------------------------------グループ координаты ----
+
+
+def _find_group_cells(df: pd.DataFrame, cfg: ParserConfig) -> list[tuple[int, int, str]]:
+    """Все ячейки, точно совпадающие с маской названия группы (row, col, name)."""
+    cells: list[tuple[int, int, str]] = []
+    for r in range(len(df)):
+        for c in range(df.shape[1]):
+            v = _cell_to_str(df.iat[r, c])
+            if _is_group_name(v, cfg):
+                cells.append((r, c, v))
+    return cells
+
+
+# --------------------------------------------- чтение сетки с merge-ячейками ---
+
+
+def _read_sheet_grid(content: bytes, sheet_name: str) -> pd.DataFrame:
+    """Читает лист как «сырую» сетку с РАЗВЁРНУТЫМИ объединёнными ячейками.
+
+    openpyxl хранит значение только в левой-верхней ячейке merged-области,
+    остальные возвращает как None. Здесь мы протягиваем значение каждой
+    объединённой области на все её ячейки — чтобы предмет/преподаватель,
+    занимающие несколько строк, читались на каждой строке пары.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+    ws = wb[sheet_name]
+
+    grid: list[list] = [[cell.value for cell in row] for row in ws.iter_rows()]
+
+    # Разворачиваем каждую объединённую область вниз и вправо.
+    for merged in ws.merged_cells.ranges:
+        value = ws.cell(row=merged.min_row, column=merged.min_col).value
+        if value is None:
+            continue
+        for ri in range(merged.min_row - 1, min(merged.max_row, len(grid))):
+            for ci in range(merged.min_col - 1, min(merged.max_col, len(grid[ri]))):
+                grid[ri][ci] = value
+
+    return pd.DataFrame(grid, dtype=object)
+
+
+def _parse_sheet_by_groups(
+    df: pd.DataFrame, cfg: ParserConfig, content: bytes, sheet_name: str
+) -> dict[str, list[Lesson]]:
+    """Якорный парсинг: у каждой группы свой блок столбцов справа.
+
+    Схема файла (подтверждена на реальных данных):
+      строка N:  1ИСИП-25-9 (J) | 1ОГР-25-9 (N) | 1ЭП-26-9 (S)
+      строка N+1: данные пар — по 3 столбца на группу:
+                  [предмет] [преподаватель] [кабинет]
+
+    Блок группы = от её столбца до столбца следующей группы (или конца листа).
+    Данные читаются ТОЛЬКО из этого блока — в столбцы соседей не залезаем.
+    """
+    group_cells = _find_group_cells(df, cfg)
+    if not group_cells:
+        raise ParseError(
+            "не найдены названия групп на листе %s (маска: %s)"
+            % (sheet_name, cfg.GROUP_NAME_PATTERN)
+        )
+
+    # Строка с названиями групп: та, где их больше всего.
+    by_row: dict[int, list[tuple[int, str]]] = {}
+    for r, c, name in group_cells:
+        by_row.setdefault(r, []).append((c, name))
+    header_row = max(by_row, key=lambda k: len(by_row[k]))
+    cells = sorted(by_row[header_row], key=lambda x: x[0])
+
+    ncols = df.shape[1]
+    groups: dict[str, list[Lesson]] = {}
+
+    for i, (sc, name) in enumerate(cells):
+        # Границы блока группы: до столбца следующей группы.
+        block_end = cells[i + 1][0] if i + 1 < len(cells) else ncols
+        block_cols = list(range(sc, block_end))
+
+        lessons: list[Lesson] = []
+        last_subject = ""
+        last_teacher = ""
+        last_room = ""
+        seen_numbers: set[int] = set()
+
+        for r in range(header_row + 1, len(df)):
+            # Номер пары — только в первом столбце блока группы.
+            lesson_number = _to_int(df.iat[r, sc])
+            if lesson_number is None or lesson_number in seen_numbers:
+                continue
+            seen_numbers.add(lesson_number)
+
+            # Читаем ровно три столбца блока: предмет, преподаватель, кабинет.
+            subject = _cell_to_str(df.iat[r, block_cols[0]]) if block_cols else ""
+            teacher = (
+                _normalize_teacher(_cell_to_str(df.iat[r, block_cols[1]]))
+                if len(block_cols) > 1 else ""
+            )
+            room = (
+                _clean_room(_cell_to_str(df.iat[r, block_cols[2]]))
+                if len(block_cols) > 2 else ""
+            )
+
+            # Если ячейка пустая (не было merge) — берём предыдущее значение:
+            # так «размазанные» пары читаются один раз.
+            if not subject:
+                subject = last_subject
+            else:
+                last_subject = subject
+            if not teacher:
+                teacher = last_teacher
+            else:
+                last_teacher = teacher
+            if not room:
+                room = last_room
+            else:
+                last_room = room
+
+            lessons.append(
+                Lesson(
+                    lesson_number=lesson_number,
+                    time="",
+                    subject=subject,
+                    room=room,
+                    teacher=teacher,
+                    subgroups=[],
+                )
+            )
+
+        groups.setdefault(name, []).extend(lessons)
+
+    # Строгая проверка: если у ВСЕХ групп нет ни одного непустого предмета —
+    # это ошибка формата, а не «пустое расписание».
+    filled = [
+        l for lessons in groups.values() for l in lessons
+        if l.subject.strip() and l.subject.strip().lower() not in {"окно", "-", "—"}
+    ]
+    if not filled:
+        logger.error(
+            "лист %s: все пары пустые/«окно» у групп %s — проверь структуру файла",
+            sheet_name, list(groups.keys()),
+        )
+        raise ParseError(
+            "лист %s: не найдено ни одной заполненной пары у групп %s"
+            % (sheet_name, ", ".join(groups.keys()))
+        )
+
+    return groups
+
+
+# ------------------------------------------------------ чтение одной группы ---
+
+
+def _find_room_right(df: pd.DataFrame, r: int, sc: int, boundary: int) -> str:
+    """Ближайшая ячейка справа от sc (до boundary), похожая на аудиторию."""
+    for c in range(sc + 1, boundary):
+        cell = _cell_to_str(df.iat[r, c])
+        if not cell:
+            continue
+        if _is_fio(cell):
+            continue
+        if _is_subject_like(cell):
+            continue
+        room = _clean_room(cell)
+        if room:
+            return room
+    return ""
+
+
+def _find_teacher_below(df: pd.DataFrame, r: int, sc: int) -> str:
+    """ФИО в ячейке (r, sc) — преподаватель пары из строки ниже."""
+    if r >= len(df):
+        return ""
+    cell = _cell_to_str(df.iat[r, sc])
+    return _normalize_teacher(cell) if _is_fio(cell) else ""
+
+
 def _extract_subgroups(
     df, r: int, sc: int, block_end: int, lesson_col: int, cfg: ParserConfig,
     stop_cols: frozenset = frozenset(), main_subject: str = "",
+    col_limit: Optional[int] = None,
 ) -> list[SubgroupInfo]:
-    """Собирает подгруппы из ВСЕХ колонок строки расписания.
+    """Собирает подгруппы из ячеек строки r, начиная с колонки sc.
 
-    Поддерживаются оба реальных формата:
-
-    1) подгруппы двумя парами колонок, преподаватели — строкой ниже:
-         Иностранный язык | 121 | Иностранный язык | 202
-         Байшева Я. В.    |     | Ощепкова А. С.   |
-    2) подгруппы в одной строке подряд:
-         Иностранный язык | Ино 319 | Кобзова С. В. | Ино 202 | Ощепкова А. С.
-
-    Каждая ячейка классифицируется динамически (ФИО / аудитория / название
-    предмета подгруппы), пары собираются по порядку колонок. Ранних выходов
-    нет — обрабатываются все подгруппы, сколько бы их ни было.
+    Сохранено для обратной совместимости с тестами. col_limit — жёсткая
+    граница по колонкам (столбец следующей группы), чтобы подгруппы не
+    «перетекали» в соседние группы.
     """
-    ncols = df.shape[1]
+    ncols = df.shape[1] if col_limit is None else min(col_limit, df.shape[1])
     has_teacher_row = (
         r + 1 < block_end and _to_int(df.iat[r + 1, lesson_col]) is None
     )
 
-    # --- Явный признак деления на подгруппы ---------------------------------
-    # Подгруппы «придумывать» нельзя: если в строке нет ВТОРОЙ ячейки с тем же
-    # предметом (формат «предмет|ауд|предмет|ауд») и нет второго ФИО в самой
-    # строке (инлайн-формат) — это обычная пара, возвращаем пустой список.
-    # Преподаватель под предметом — это обычный учитель пары, а не «1 п/г».
     evidence = False
     for c in range(sc + 1, ncols):
         cell_probe = _cell_to_str(df.iat[r, c])
@@ -255,7 +382,6 @@ def _extract_subgroups(
         subs.append(current)
         return current
 
-    # первая подгруппа: предмет в колонке sc, преподаватель — под ним
     start(teacher=teacher_under(sc))
 
     empty_gap = 0
@@ -266,7 +392,7 @@ def _extract_subgroups(
         if c in stop_cols and not (
             _is_subject_like(cell) and _same_subject(cell, main_subject)
         ) and not _looks_like_data(cell):
-            break  # колонка предмета другой группы
+            break
 
         if cell and not _is_group_name(cell, cfg):
             if _is_fio(cell):
@@ -277,10 +403,8 @@ def _extract_subgroups(
             elif _is_subject_like(cell) and (
                 _same_subject(cell, main_subject) or not _looks_like_data(cell)
             ):
-                # предмет второй подгруппы: начинаем новую, ФИО берём под ним
                 start(teacher=under)
             else:
-                # аудитория
                 room = _clean_room(cell) or None
                 if current is not None and not current.room:
                     current.room = room
@@ -301,7 +425,6 @@ def _extract_subgroups(
         if empty_gap > 3:
             break
 
-    # отбрасываем пустые и дубли (одна и та же пара) 
     result: list[SubgroupInfo] = []
     for sub in subs:
         if not sub.room and not sub.teacher:
@@ -312,119 +435,199 @@ def _extract_subgroups(
 
     for i, sub in enumerate(result, 1):
         sub.number = i
-    # --- ВРЕМЕННЫЙ DEBUG (удалить после диагностики) ----------------------
-    try:
-        _subject = _cell_to_str(df.iat[r, sc]) if sc < df.shape[1] else ""
-        if "иностранн" in _subject.lower() or len(result) >= 2:
-            print(
-                "DEBUG SUBGROUPS: row=%s sc=%s subject=%r stop_cols=%s -> %s"
-                % (
-                    r,
-                    sc,
-                    _subject,
-                    sorted(stop_cols),
-                    [(s.number, s.room, s.teacher) for s in result],
-                ),
-                flush=True,
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    # ----------------------------------------------------------------------
     return result
 
 
-def _parse_sheet(
-    df: pd.DataFrame, cfg: ParserConfig, lesson_col: int, subject_cols: list[int], room_cols: list[int]
-) -> dict[str, list[Lesson]]:
-    pairs = [
-        (sc, room_cols[i] if i < len(room_cols) else sc + 4)
-        for i, sc in enumerate(subject_cols)
-    ]
-    nrows = len(df)
+def _looks_like_data(value: str) -> bool:
+    if not value:
+        return False
+    if _is_fio(value):
+        return True
+    return any(ch.isdigit() for ch in value)
 
-    # строки-границы блоков (строки с названиями групп)
-    block_rows: list[int] = []
-    for r in range(nrows):
-        for sc, _ in pairs:
-            if _is_group_name(_cell_to_str(df.iat[r, sc]), cfg):
-                block_rows.append(r)
+
+def _read_pair(
+    df: pd.DataFrame,
+    r: int,
+    sc: int,
+    next_sc: int,
+    lesson_col: int,
+    cfg: ParserConfig,
+) -> tuple[str, str, list]:
+    """Читает одну пару (предмет, каб, преподаватель, подгруппы) из строки r.
+
+    Якорь — колонка sc группы. Данные только из этой строки и колонки sc.
+    """
+    subject = _cell_to_str(df.iat[r, sc])
+
+    # Подгруппы: сканируем ячейки справа от sc до границы следующей группы.
+    stop_cols = frozenset(
+        c for c in range(sc + 1, next_sc) if _is_group_name(_cell_to_str(df.iat[r, c]), cfg)
+    )
+    subgroups = _extract_subgroups(
+        df, r, sc, len(df), lesson_col, cfg,
+        stop_cols=stop_cols, main_subject=subject, col_limit=next_sc,
+    )
+
+    if len(subgroups) >= 2:
+        room = subgroups[0].room or ""
+        teacher = subgroups[0].teacher or ""
+    elif len(subgroups) == 1:
+        room = subgroups[0].room or ""
+        teacher = subgroups[0].teacher or ""
+        subgroups = []
+    else:
+        room = _find_room_right(df, r, sc, next_sc)
+        teacher = _find_teacher_below(df, r + 1, sc)
+        subgroups = []
+
+    return room, teacher, subgroups
+
+
+def _parse_group_column(
+    df: pd.DataFrame,
+    header_row: int,
+    sc: int,
+    next_sc: int,
+    lesson_col: int,
+    cfg: ParserConfig,
+) -> list[Lesson]:
+    """Читает все пары группы из столбца sc (группы идут в строку)."""
+    name = _cell_to_str(df.iat[header_row, sc])
+    lessons: list[Lesson] = []
+    for r in range(header_row + 1, len(df)):
+        lesson_number = _to_int(df.iat[r, lesson_col])
+        if lesson_number is None:
+            continue  # строка с ФИО преподавателя или пустая
+        room, teacher, subgroups = _read_pair(df, r, sc, next_sc, lesson_col, cfg)
+        lessons.append(
+            Lesson(
+                lesson_number=lesson_number,
+                time="",
+                subject=_cell_to_str(df.iat[r, sc]),
+                room=room,
+                teacher=teacher,
+                subgroups=subgroups,
+            )
+        )
+    return lessons
+
+
+def _parse_group_row(
+    df: pd.DataFrame,
+    header_col: int,
+    sr: int,
+    next_sr: int,
+    lesson_col: int,
+    cfg: ParserConfig,
+) -> list[Lesson]:
+    """Читает все пары группы из строки sr (группы идут в столбик)."""
+    name = _cell_to_str(df.iat[sr, header_col])
+    lessons: list[Lesson] = []
+    for c in range(header_col + 1, df.shape[1]):
+        lesson_number = _to_int(df.iat[sr, c])  # не используется для строки
+        # Для вертикальной ориентации данные идут вправо: число пары,
+        # затем предмет, каб, преподаватель — в同じ строке. Читаем пары
+        # последовательностью: [номер][предмет][каб][преподаватель]...
+        # Упрощённо: каждая пара занимает 4 ячейки вправо.
+        idx = c
+        while idx < next_sr:
+            num_cell = _cell_to_str(df.iat[sr, idx])
+            ln = _to_int(num_cell)
+            if ln is None:
                 break
+            subject = _cell_to_str(df.iat[sr, idx + 1]) if idx + 1 < next_sr else ""
+            room = _clean_room(_cell_to_str(df.iat[sr, idx + 2])) if idx + 2 < next_sr else ""
+            teacher = _normalize_teacher(_cell_to_str(df.iat[sr, idx + 3])) if idx + 3 < next_sr else ""
+            lessons.append(
+                Lesson(
+                    lesson_number=ln,
+                    time="",
+                    subject=subject,
+                    room=room,
+                    teacher=teacher,
+                    subgroups=[],
+                )
+            )
+            idx += 4
+        break  # одна строка — одна группа, выходим
+    return lessons
 
-    if not block_rows:
-        raise ParseError("не найдены названия групп на листе")
+
+# ----------------------------------------------------------- основной парсинг ----
+
+
+def _parse_sheet(df: pd.DataFrame, cfg: ParserConfig) -> dict[str, list[Lesson]]:
+    """Якорный парсинг листа по точным координатам названий групп."""
+    ncols = df.shape[1]
+    lesson_col = _find_lesson_col(df)
+    group_cells = _find_group_cells(df, cfg)
+
+    if not group_cells:
+        raise ParseError("не найдены названия групп на листе (маска: %s)" % cfg.GROUP_NAME_PATTERN)
+
+    rows = {rc for rc, _, _ in group_cells}
+    cols = {cc for _, cc, _ in group_cells}
 
     groups: dict[str, list[Lesson]] = {}
-    for bi, block_start in enumerate(block_rows):
-        block_end = block_rows[bi + 1] if bi + 1 < len(block_rows) else nrows
-        names = [_cell_to_str(df.iat[block_start, sc]) for sc, _ in pairs]
+    all_suspicious = True
 
-        for r in range(block_start + 1, block_end):
-            # --- ВРЕМЕННЫЙ DEBUG (удалить после диагностики) --------------
-            try:
-                _dbg_row = [
-                    (c, _cell_to_str(df.iat[r, c]))
-                    for c in range(df.shape[1])
-                    if _cell_to_str(df.iat[r, c])
-                ]
-                if any("иностранн" in str(v).lower() for _, v in _dbg_row):
-                    print(f"DEBUG ROW: sheet_row={r} cells={_dbg_row}", flush=True)
-                    print(
-                        "DEBUG COLS: lesson_col=%s pairs=%s subject_cols=%s"
-                        % (lesson_col, pairs, subject_cols),
-                        flush=True,
-                    )
-            except Exception as _dbg_exc:  # noqa: BLE001
-                print(f"DEBUG ROW ERROR: {_dbg_exc}", flush=True)
-            # --------------------------------------------------------------
+    if len(rows) == 1:
+        # Группы идут в строку → читаем каждый столбец группы вниз.
+        header_row = list(rows)[0]
+        sorted_cells = sorted(group_cells, key=lambda x: x[1])
+        for i, (r, sc, name) in enumerate(sorted_cells):
+            next_sc = sorted_cells[i + 1][1] if i + 1 < len(sorted_cells) else ncols
+            lessons = _parse_group_column(df, r, sc, next_sc, lesson_col, cfg)
+            groups.setdefault(name, []).extend(lessons)
+            if lessons and any(l.subject or l.room or l.teacher for l in lessons):
+                all_suspicious = False
+    elif len(cols) == 1:
+        # Группы идут в столбик → читаем каждую строку группы вправо.
+        header_col = list(cols)[0]
+        sorted_cells = sorted(group_cells, key=lambda x: x[0])
+        for i, (r, cc, name) in enumerate(sorted_cells):
+            next_r = sorted_cells[i + 1][0] if i + 1 < len(sorted_cells) else len(df)
+            lessons = _parse_group_row(df, cc, r, next_r, lesson_col, cfg)
+            groups.setdefault(name, []).extend(lessons)
+            if lessons and any(l.subject or l.room or l.teacher for l in lessons):
+                all_suspicious = False
+    else:
+        # Смешанная разметка: несколько строк с названиями групп — каждая строка
+        # — отдельный блок. Читаем как «группы в строке» для каждой такой строки.
+        by_row: dict[int, list[tuple[int, str]]] = {}
+        for r, c, name in group_cells:
+            by_row.setdefault(r, []).append((c, name))
+        for r in sorted(by_row):
+            cells = sorted(by_row[r], key=lambda x: x[0])
+            for i, (sc, name) in enumerate(cells):
+                next_sc = cells[i + 1][0] if i + 1 < len(cells) else ncols
+                lessons = _parse_group_column(df, r, sc, next_sc, lesson_col, cfg)
+                groups.setdefault(name, []).extend(lessons)
+                if lessons and any(l.subject or l.room or l.teacher for l in lessons):
+                    all_suspicious = False
 
-            lesson_number = _to_int(df.iat[r, lesson_col])
-            if lesson_number is None:
-                continue  # строка с ФИО преподавателя или пустая
-            for gi, (sc, rc) in enumerate(pairs):
-                name = names[gi]
-                if not name:
-                    continue
-                subject = _cell_to_str(df.iat[r, sc])
-                room = _clean_room(_cell_to_str(df.iat[r, rc]))
-                teacher = ""
-                if r + 1 < block_end and _to_int(df.iat[r + 1, lesson_col]) is None:
-                    # следующая строка — ФИО преподавателя (в колонке предмета)
-                    teacher = _normalize_teacher(df.iat[r + 1, sc])
-                # подгруппы: все ячейки справа от предмета (иностранный язык и др.)
-                stop_cols = frozenset(
-                    other_sc for other_sc, _ in pairs[gi + 1:] if other_sc > sc
-                )
-                subgroups = _extract_subgroups(
-                    df, r, sc, block_end, lesson_col, cfg,
-                    stop_cols=stop_cols, main_subject=subject,
-                )
-                # разбивка на подгруппы — только если пар две и больше
-                if len(subgroups) >= 2:
-                    # обратная совместимость: room/teacher — данные 1-й подгруппы
-                    room = subgroups[0].room or room
-                    teacher = subgroups[0].teacher or teacher
-                elif len(subgroups) == 1:
-                    # одна пара: обычный формат, поля берём из неё
-                    room = subgroups[0].room or room
-                    teacher = subgroups[0].teacher or teacher
-                    subgroups = []
-                else:
-                    subgroups = []
-                groups.setdefault(name, []).append(
-                    Lesson(
-                        lesson_number=lesson_number,
-                        time="",
-                        subject=subject,
-                        room=room,
-                        teacher=teacher,
-                        subgroups=subgroups,
-                    )
-                )
+    if not groups:
+        raise ParseError("не удалось извлечь пары ни для одной группы на листе")
+
+    # Строгая проверка: если все пары во всех группах — «окно»/пустые,
+    # это подозрительно — пишем ошибку в лог (не молчим).
+    if all_suspicious:
+        logger.error(
+            "расписание выглядит подозрительно: все пары — окна/пустые, "
+            "группы: %s", list(groups.keys())
+        )
+
     return groups
 
 
 def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]:
-    """Парсит xlsx. Возвращает {группа: [Lesson, ...]}."""
+    """Парсит xlsx. Возвращает {группа: [Lesson, ...]}.
+
+    Основной путь — якорный парсинг по координатам названий групп с
+    разворотом объединённых ячеек (_parse_sheet_by_groups). Если он не смог
+    разобрать лист, пробуем универсальный _parse_sheet.
+    """
     try:
         excel = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
     except Exception as exc:
@@ -433,15 +636,26 @@ def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]
     groups: dict[str, list[Lesson]] = {}
     errors: list[str] = []
     for sheet_name in excel.sheet_names:
+        sheet_groups: dict[str, list[Lesson]] = {}
+        # 1) основной путь: сетка с развёрнутыми merged-ячейками
         try:
-            df = pd.read_excel(excel, sheet_name=sheet_name, header=None, dtype=object)
-            lesson_col, subject_cols, room_cols = _find_columns(df, cfg)
-            sheet_groups = _parse_sheet(df, cfg, lesson_col, subject_cols, room_cols)
-            for g, lessons in sheet_groups.items():
-                groups.setdefault(g, []).extend(lessons)
+            df_full = _read_sheet_grid(content, sheet_name)
+            sheet_groups = _parse_sheet_by_groups(df_full, cfg, content, sheet_name)
         except Exception as exc:
-            errors.append(f"{sheet_name}: {exc}")
-            logger.warning("лист %s не распарсился: %s", sheet_name, exc)
+            errors.append(f"{sheet_name} (grid): {exc}")
+            logger.warning("лист %s (grid) не распарсился: %s", sheet_name, exc)
+        # 2) резервный путь: обычное чтение pandas + универсальный разбор
+        if not sheet_groups:
+            try:
+                df_plain = pd.read_excel(
+                    excel, sheet_name=sheet_name, header=None, dtype=object
+                )
+                sheet_groups = _parse_sheet(df_plain, cfg)
+            except Exception as exc:
+                errors.append(f"{sheet_name} (plain): {exc}")
+                logger.warning("лист %s (plain) не распарсился: %s", sheet_name, exc)
+        for g, lessons in sheet_groups.items():
+            groups.setdefault(g, []).extend(lessons)
 
     if not groups:
         raise ParseError("ни один лист не удалось распарсить: " + "; ".join(errors))

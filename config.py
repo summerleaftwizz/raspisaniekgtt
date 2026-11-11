@@ -78,9 +78,6 @@ class Settings:
         default_factory=lambda: _get_int("CHANGE_CHECK_INTERVAL_MINUTES", 60)
     )
     SHOW_TIME: bool = field(default_factory=lambda: _get_bool("SHOW_TIME", True))
-    # Google Gemini: ключ из Google AI Studio и модель для ответов.
-    GEMINI_API_KEY: str = field(default_factory=lambda: _get("GEMINI_API_KEY"))
-    GEMINI_MODEL: str = field(default_factory=lambda: _get("GEMINI_MODEL", "gemini-2.0-flash"))
     parser: ParserConfig = field(default_factory=ParserConfig)
 
 

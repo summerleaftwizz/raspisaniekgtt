@@ -91,20 +91,3 @@ class Deadline(Base):
     due_ts: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     notified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-class GeminiHistory(Base):
-    """История диалога с Gemini: последние сообщения подмешиваются в запрос.
-
-    role: 'user' или 'model' (как в Gemini API).
-    """
-
-    __tablename__ = "gemini_history"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False)
-    content: Mapped[str] = mapped_column(String(4096), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )

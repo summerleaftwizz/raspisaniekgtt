@@ -135,6 +135,46 @@ async def cb_stats(callback: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(F.data == "adm:refresh")
+async def cb_refresh_schedule(callback: CallbackQuery, bot: Bot) -> None:
+    """«🔄 Обновить расписание» — скачать заново с Яндекс.Диска и перепарсить."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        "🔄 Обновляю расписание с Яндекс.Диска…", reply_markup=build_main_menu()
+    )
+    try:
+        files_done, groups_total, errors = await watcher.force_refresh(bot)
+    except Exception as exc:
+        # Полный провал (сеть/Диск) — сообщаем админу текст ошибки.
+        logger.exception("force_refresh упал полностью")
+        await callback.message.answer(
+            f"❌ Ошибка обновления: <code>{html.escape(str(exc))[:500]}</code>",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    if files_done == 0:
+        # Ни один файл не обработан — отправляем ошибки (или общий сбой).
+        detail = "\n".join(f"• <code>{html.escape(e)[:200]}</code>" for e in errors)
+        await callback.message.answer(
+            "❌ Расписание не обновлено.\n" + (detail or "Причина неизвестна."),
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    text = f"✅ Расписание обновлено! Обработано {files_done} файлов, {groups_total} групп."
+    if errors:
+        # Частичный успех: часть файлов упала, но данные обновлены.
+        text += "\n\n⚠️ Ошибки:\n" + "\n".join(
+            f"• <code>{html.escape(e)[:200]}</code>" for e in errors
+        )
+    await callback.message.answer(text, reply_markup=build_main_menu())
+
+
 # --- старые админ-команды --------------------------------------------------
 
 

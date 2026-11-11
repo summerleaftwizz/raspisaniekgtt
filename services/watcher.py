@@ -228,6 +228,69 @@ async def reparse_latest(bot: Bot) -> Optional[str]:
         return await _process_file(client, bot, latest, force=True)
 
 
+async def force_refresh(bot: Bot) -> tuple[int, int, list[str]]:
+    """Принудительное обновление расписания (кнопка админ-панели).
+
+    1. Скачивает ВСЕ файлы studentam_*.xlsx с Яндекс.Диска заново (force=True
+       игнорирует метку «уже обработан»).
+    2. Парсит каждый файл и перезаписывает расписание в БД (replace_schedule).
+    3. Возвращает (обработано_файлов, всего_групп, список_ошибок).
+    """
+    files_done = 0
+    groups_total = set()
+    errors: list[str] = []
+
+    async with YaDiskClient(
+        settings.YADISK_PUBLIC_URL, settings.REQUEST_TIMEOUT, settings.REQUEST_RETRIES
+    ) as client:
+        items = await client.list_resources()
+        student_files = [
+            it
+            for it in items
+            if it.get("type") == "file"
+            and STUDENT_FILE_RE.match((it.get("name") or "").strip())
+        ]
+        if not student_files:
+            return 0, 0, ["на Яндекс.Диске нет файлов studentam_*.xlsx"]
+
+        for item in sorted(student_files, key=lambda it: it.get("name") or ""):
+            name = (item.get("name") or "").strip()
+            try:
+                # force=True: игнорируем «уже обработан» и качаем заново
+                content = await client.download_item(item)
+                groups = parser.parse_schedule(content, settings.parser)
+
+                # Перезаписываем расписание в БД по каждой группе
+                async with SessionLocal() as session:
+                    for group, lessons in groups.items():
+                        rows = [
+                            {
+                                "lesson_number": l.lesson_number,
+                                "time": l.time,
+                                "subject": l.subject,
+                                "room": l.room,
+                                "teacher": l.teacher,
+                                "subgroups": [
+                                    asdict(s) if is_dataclass(s) and not isinstance(s, type) else s
+                                    for s in (l.subgroups or [])
+                                ],
+                            }
+                            for l in lessons
+                        ]
+                        await crud.replace_schedule(session, _date_from_filename(name), group, rows)
+                    await session.commit()
+                    await crud.mark_known(session, name)
+
+                files_done += 1
+                groups_total.update(groups.keys())
+                logger.info("force_refresh: %s обработан (%d групп)", name, len(groups))
+            except Exception as exc:
+                logger.exception("force_refresh: ошибка обработки %s", name)
+                errors.append(f"{name}: {exc}")
+
+    return files_done, len(groups_total), errors
+
+
 async def watcher_loop(bot: Bot) -> None:
     logger.info("watcher запущен, интервал %d мин", settings.POLL_INTERVAL_MINUTES)
     while True:
