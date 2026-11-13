@@ -305,3 +305,46 @@ def test_no_subgroups_field_is_ok():
     text = format_schedule("26.10", "1ИСИП-25-9", [entry(3, room="307", teacher="Иванов И. И.")])
     assert "п/г" not in text
     assert "🚪 каб. 307 · Иванов И. И." in text
+
+
+# --- пустые пары и окна -----------------------------------------------------
+
+
+def test_windows_not_counted_as_pairs():
+    """«Всего N пар» считает только пары с предметом; окна — не пары."""
+    entries = [
+        entry(1, subject=""),           # пустая строка
+        entry(2, subject="окно"),       # окно из файла
+        entry(3, subject="Математика"),
+        entry(4, subject="Русский язык"),
+    ]
+    text = format_notification("26.10", "ГР-1", entries, now=datetime(2026, 10, 26, 9, 0))
+    assert "всего 2 пар" in text
+    # окна отображаются, но нумерация не сдвигается
+    assert "1️⃣ <i>пара — окно</i>" in text
+    assert "2️⃣ <i>пара — окно</i>" in text
+    assert "3 пара" in text
+    assert "4 пара" in text
+
+
+def test_window_before_first_pair_keeps_numbering():
+    """Первая пара пустая → «1 пара — окно», следующая — «2 пара» (10:20)."""
+    text = format_schedule(
+        "26.10", "ГР-1",
+        [entry(1, subject=""), entry(2, subject="Русский язык", room="301")],
+        now=datetime(2026, 10, 26, 12, 0),
+    )
+    assert "1️⃣ <i>пара — окно</i>" in text
+    assert "🕒 <b>2 пара</b> · 10:20 – 11:50" in text
+    assert "Начало занятий в 08:30" not in text
+
+
+def test_state_ignores_window_rows():
+    """Окна не считаются парами в состоянии «что сейчас»."""
+    state = get_current_state(
+        [entry(1, subject="окно"), entry(2, subject="Русский язык")],
+        datetime(2026, 10, 26, 9, 0),
+    )
+    assert state.kind == "before"
+    assert state.next_lesson.lesson_number == 2
+    assert state.until == "10:20"

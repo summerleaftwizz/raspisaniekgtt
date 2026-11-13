@@ -15,7 +15,9 @@
 """
 import asyncio
 import hashlib
+import html
 import logging
+import re
 from dataclasses import asdict, is_dataclass
 from typing import Optional
 
@@ -36,6 +38,58 @@ from services.watcher import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _esc(value) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _clean(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+# Пометки «пустой» пары: окна и прочерки изменениями не считаются.
+_WINDOW_SUBJECTS = frozenset({"окно", "окна", "-", "—", "–", "нет", "нет пар"})
+
+
+def _is_real_subject(subject: str) -> bool:
+    """Пара настоящая: предмет не пустой и не пометка «окно»."""
+    s = _clean(subject).lower().strip(" .,:;!")
+    return bool(s) and s not in _WINDOW_SUBJECTS
+
+
+def _pair_fields(item) -> dict:
+    """Нормализованные поля пары из Lesson/ScheduleEntry/dict."""
+    if isinstance(item, dict):
+        return {
+            "num": item.get("lesson_number"),
+            "subject": _clean(item.get("subject")),
+            "room": _clean(item.get("room")),
+            "teacher": _clean(item.get("teacher")),
+            "time": _clean(item.get("time")),
+        }
+    return {
+        "num": getattr(item, "lesson_number", None),
+        "subject": _clean(getattr(item, "subject", "")),
+        "room": _clean(getattr(item, "room", "")),
+        "teacher": _clean(getattr(item, "teacher", "")),
+        "time": _clean(getattr(item, "time", "")),
+    }
+
+
+def _real_pairs(items) -> dict[int, dict]:
+    """Реальные пары по НОМЕРУ ПАРЫ: только записи с предметом.
+
+    Пустые пары (без предмета / «окно») в сравнении не участвуют —
+    изменения только среди них уведомлений не создают.
+    """
+    result: dict[int, dict] = {}
+    for item in items:
+        f = _pair_fields(item)
+        if f["num"] is None or not _is_real_subject(f["subject"]):
+            continue
+        result.setdefault(int(f["num"]), f)
+    return result
 
 
 # --------------------------------------------------------------- fingerprint
@@ -91,51 +145,80 @@ def _day_name(date_label: str) -> str:
     return date_label
 
 
-def diff_text(date_label: str, group: str, old_rows: list[ScheduleEntry], new_lessons: list) -> str:
-    """Человекочитаемое описание изменений: «3 пара перенесена в каб. 317 (было 315)»."""
-    old_by_num = {r.lesson_number: r for r in old_rows}
+def _diff(
+    date_label: str, old_rows: list[ScheduleEntry], new_lessons: list
+) -> tuple[list[str], set[str]]:
+    """Сравнение расписаний: (строки diff, затронутые преподаватели).
+
+    Пары сравниваются по НОМЕРУ ПАРЫ и ПРЕДМЕТУ:
+    * номер и предмет совпали, кабинет тот же — изменения НЕТ (даже если
+      изменилось ФИО);
+    * номер и предмет совпали, кабинет другой — «перемещена»;
+    * номер и предмет совпали, кабинет в новом файле не найден — об этой
+      паре НЕ сообщаем (иначе ложное «перемещена в каб. (было 301)»);
+    * пары с номером, которого не было, — «Добавлена»;
+    * пары, которых больше нет, — «Отменена».
+    Пустые пары (без предмета) игнорируются с обеих сторон.
+    """
+    old = _real_pairs(old_rows)
+    new = _real_pairs(new_lessons)
     lines: list[str] = []
+    touched: set[str] = set()
 
-    for l in new_lessons:
-        if isinstance(l, dict):
-            num = l.get("lesson_number")
-            subject, room, teacher = l.get("subject"), l.get("room"), l.get("teacher")
-            time = l.get("time")
-        else:
-            num = l.lesson_number
-            subject, room, teacher = l.subject, l.room, l.teacher
-            time = l.time
-        old = old_by_num.get(num)
-        if old is None:
-            subject_e = (subject or "").strip()
-            room_e = (room or "").strip()
-            lines.append(
-                f"➕ Добавлена <b>{num} пара</b>"
-                + (f" ({time})" if time else "")
-                + f": {subject_e}"
-                + (f", каб. {room_e}" if room_e else "")
-            )
+    for num in sorted(new):
+        nf = new[num]
+        of = old.get(num)
+        if of is None:
+            line = f"➕ Добавлена <b>{num} пара</b>"
+            if nf["time"]:
+                line += f" ({nf['time']})"
+            line += f": {_esc(nf['subject'])}"
+            if nf["room"]:
+                line += f", каб. {_esc(nf['room'])}"
+            lines.append(line)
+            if nf["teacher"]:
+                touched.add(nf["teacher"])
             continue
-        old_by_num.pop(num)
-        changes = []
-        if (old.room or "") != (room or ""):
+
+        changes: list[str] = []
+        if nf["subject"] != of["subject"]:
             changes.append(
-                f"🚪 перенесена в каб. {room} (было {old.room or '—'})"
+                f"📚 теперь {_esc(nf['subject'])} (было {_esc(of['subject']) or '—'})"
             )
-        if (old.subject or "") != (subject or ""):
-            changes.append(f"📚 теперь {subject} (было {old.subject or '—'})")
-        if (old.teacher or "") != (teacher or ""):
-            changes.append(f"👤 преподаватель: {teacher} (было {old.teacher or '—'})")
+        if nf["room"] != of["room"] and nf["room"]:
+            changes.append(
+                f"🚪 перенесена в каб. {_esc(nf['room'])} "
+                f"(было {_esc(of['room']) or '—'})"
+            )
+        # nf["room"] пуст, а старый был — уведомление об этой паре не шлём.
         if changes:
-            head = f"{_day_name(date_label)} <b>{num} пара</b>" + (f" ({time})" if time else "")
+            head = f"{_day_name(date_label)} <b>{num} пара</b>"
+            if nf["time"]:
+                head += f" ({nf['time']})"
             lines.append(head + " — " + "; ".join(changes))
+            for t in (nf["teacher"], of["teacher"]):
+                if t:
+                    touched.add(t)
 
-    # Пары, которые были, а стали нет — отмены.
-    for num, old in sorted(old_by_num.items()):
-        lines.append(
-            f"❌ Отменена <b>{num} пара</b> ({old.time or ''}): {old.subject or ''}".rstrip()
-        )
+    # Пары, которые были, а стали нет — отмены (только реальные пары).
+    for num in sorted(set(old) - set(new)):
+        of = old[num]
+        line = f"❌ Отменена <b>{num} пара</b>"
+        if of["time"]:
+            line += f" ({of['time']})"
+        line += f": {_esc(of['subject'])}"
+        lines.append(line.rstrip())
+        if of["teacher"]:
+            touched.add(of["teacher"])
 
+    return lines, touched
+
+
+def diff_text(
+    date_label: str, group: str, old_rows: list[ScheduleEntry], new_lessons: list
+) -> str:
+    """Человекочитаемое описание изменений: «3 пара перенесена в каб. 317 (было 315)»."""
+    lines, _touched = _diff(date_label, old_rows, new_lessons)
     return "\n".join(lines)
 
 
@@ -175,9 +258,10 @@ async def _notify_group_users(bot: Bot, date_label: str, group: str, text: str) 
     return sent
 
 
-async def _notify_teachers(bot: Bot, date_label: str, group: str, diff: str, new_lessons: list) -> int:
+async def _notify_teachers(
+    bot: Bot, date_label: str, group: str, diff: str, touched: set[str]
+) -> int:
     """Уведомления преподавателям, чьи пары в этой группе изменились."""
-    touched = {l.teacher for l in new_lessons if not isinstance(l, dict) and l.teacher}
     if not touched:
         return 0
     async with SessionLocal() as session:
@@ -260,7 +344,8 @@ async def check_for_changes(bot: Bot) -> int:
                         await session.commit()
                         continue
 
-                    diff = diff_text(date_label, group, old_rows, lessons)
+                    diff_lines, touched_teachers = _diff(date_label, old_rows, lessons)
+                    diff = "\n".join(diff_lines)
 
                 # Обновляем БД и снапшот, затем рассылаем.
                 async with SessionLocal() as session:
@@ -290,7 +375,7 @@ async def check_for_changes(bot: Bot) -> int:
                     continue
                 try:
                     await _notify_group_users(bot, date_label, group, diff)
-                    await _notify_teachers(bot, date_label, group, diff, lessons)
+                    await _notify_teachers(bot, date_label, group, diff, touched_teachers)
                     changed_groups += 1
                     logger.info("изменения %s / %s разосланы", date_label, group)
                 except TelegramAPIError:

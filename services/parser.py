@@ -334,6 +334,42 @@ def _lesson_number_at(
     return None
 
 
+def _lesson_number_strict(
+    df: pd.DataFrame, r: int, lesson_col: int
+) -> Optional[int]:
+    """Номер пары ТОЛЬКО из столбца с числами пар (без левого скана).
+
+    Иначе число 1..12 из чужой колонки (кабинет-«2», номер подгруппы)
+    сдвигает нумерацию пар.
+    """
+    if not 0 <= r < len(df) or not 0 <= lesson_col < df.shape[1]:
+        return None
+    v = _to_int(df.iat[r, lesson_col])
+    return v if v is not None and 1 <= v <= 12 else None
+
+
+def _find_lesson_col_in_block(
+    df: pd.DataFrame, row_start: int, row_end: int, col_end: int
+) -> Optional[int]:
+    """Столбец с номерами пар ДЛЯ ЭТОГО блока строк.
+
+    В многослойных файлах у каждого блока групп свой столбец «Пара»;
+    глобальный столбец (_find_lesson_col) может быть пуст в этих строках.
+    Берём колонку, где в строках блока больше всего чисел 1..12.
+    """
+    best, best_score = None, 0
+    row_end = min(row_end, len(df))
+    for c in range(0, min(col_end, df.shape[1])):
+        score = 0
+        for r in range(max(0, row_start), row_end):
+            v = _to_int(df.iat[r, c])
+            if v is not None and 1 <= v <= 12:
+                score += 1
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
 def _row_belongs_to_lesson(
     df: pd.DataFrame,
     r: int,
@@ -601,9 +637,16 @@ def _parse_sheet_by_groups(
             block_cols = list(range(sc, block_end))
             if not block_cols:
                 continue
+            # Свой столбец номеров пар для этого блока строк (у нижних
+            # блоков он свой, глобальный может быть пуст).
+            pair_col = _find_lesson_col_in_block(df, hr + 1, block_rows_end, block_end)
+            if pair_col is None:
+                pair_col = lesson_col
             logger.info(
-                "лист %s, группа %s: блок столбцов %d..%d, строки %d..%d",
+                "лист %s, группа %s: блок столбцов %d..%d, строки %d..%d, "
+                "столбец номеров пар: %d",
                 sheet_name, name, sc + 1, block_end, hr + 2, block_rows_end,
+                pair_col + 1,
             )
 
             lessons: list[Lesson] = []
@@ -614,7 +657,8 @@ def _parse_sheet_by_groups(
                 if _row_has_group_name(df, r, cfg):
                     continue  # шапка следующего блока групп
 
-                lesson_number = _lesson_number_at(df, r, sc, lesson_col)
+                # Номер пары — строго из столбца с числами пар.
+                lesson_number = _lesson_number_strict(df, r, pair_col)
 
                 # Строка-продолжение без номера пары — дополняем предыдущую.
                 if lesson_number is None:
@@ -622,7 +666,7 @@ def _parse_sheet_by_groups(
                         subject, teacher, room = _classify_row(
                             df, r, block_cols, cfg,
                             skip_cols=(
-                                frozenset({lesson_col}) if lesson_col != sc
+                                frozenset({pair_col}) if pair_col != sc
                                 else frozenset()
                             ),
                         )
@@ -634,7 +678,7 @@ def _parse_sheet_by_groups(
                 # вторая запись затирает первую и предмет становится ФИО).
                 if lesson_number in seen_numbers:
                     subject, room, teacher, subgroups = _read_pair(
-                        df, r, sc, block_end, lesson_col, cfg, block_rows_end
+                        df, r, sc, block_end, pair_col, cfg, block_rows_end
                     )
                     target = prev_lesson
                     if target is None or target.lesson_number != lesson_number:
@@ -651,7 +695,7 @@ def _parse_sheet_by_groups(
 
                 seen_numbers.add(lesson_number)
                 subject, room, teacher, subgroups = _read_pair(
-                    df, r, sc, block_end, lesson_col, cfg, block_rows_end
+                    df, r, sc, block_end, pair_col, cfg, block_rows_end
                 )
                 if not room:
                     logger.info(
@@ -950,10 +994,17 @@ def _parse_group_column(
     if block_end == 0:
         block_end = len(df)
     name = _cell_to_str(df.iat[header_row, sc])
+    # Свой столбец номеров пар для этого блока строк: у нижних блоков он
+    # свой, а глобальный столбец в этих строках пуст. Номер пары берём
+    # ТОЛЬКО из столбца с числами — иначе нумерация сдвигается.
+    pair_col = _find_lesson_col_in_block(df, header_row + 1, block_end, next_sc)
+    if pair_col is None:
+        pair_col = lesson_col
     logger.info(
         "группа %s: строка заголовка %d, столбец %d, границы блока: "
-        "cols %d..%d, rows %d..%d",
+        "cols %d..%d, rows %d..%d, столбец номеров пар: %d",
         name, header_row + 1, sc + 1, sc + 1, next_sc, header_row + 2, block_end,
+        pair_col + 1,
     )
     lessons: list[Lesson] = []
     prev_lesson: Optional[Lesson] = None
@@ -961,7 +1012,7 @@ def _parse_group_column(
         if _row_has_group_name(df, r, cfg):
             continue  # следующая шапка блока / название другой группы
 
-        lesson_number = _lesson_number_at(df, r, sc, lesson_col)
+        lesson_number = _lesson_number_strict(df, r, pair_col)
         cols = list(range(sc, min(next_sc, df.shape[1])))
 
         # Строка без номера пары — продолжение предыдущей пары
@@ -971,7 +1022,7 @@ def _parse_group_column(
             if prev_lesson is not None:
                 subject, teacher, room = _classify_row(
                     df, r, cols, cfg,
-                    skip_cols=frozenset({lesson_col}) if lesson_col != sc else frozenset(),
+                    skip_cols=frozenset({pair_col}) if pair_col != sc else frozenset(),
                 )
                 _merge_lesson(prev_lesson, subject, teacher, room)
             continue
@@ -981,7 +1032,7 @@ def _parse_group_column(
         # добавляем — иначе она затрёт первую в выводе (баг: предмет = ФИО).
         if prev_lesson is not None and lesson_number == prev_lesson.lesson_number:
             subject, room, teacher, subgroups = _read_pair(
-                df, r, sc, next_sc, lesson_col, cfg, block_end
+                df, r, sc, next_sc, pair_col, cfg, block_end
             )
             _merge_lesson(prev_lesson, subject, teacher, room)
             if subgroups and not prev_lesson.subgroups:
@@ -989,7 +1040,7 @@ def _parse_group_column(
             continue
 
         subject, room, teacher, subgroups = _read_pair(
-            df, r, sc, next_sc, lesson_col, cfg, block_end
+            df, r, sc, next_sc, pair_col, cfg, block_end
         )
         if not room and _cell_to_str(df.iat[r, sc]):
             logger.info(

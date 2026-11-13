@@ -35,9 +35,33 @@ EMOJI_NUMS = {
 
 SEPARATOR = "━━━━━━━━━━━━━━"
 
+# Пометки «пустой» пары в файле: окно/прочерк — это НЕ пара.
+_WINDOW_SUBJECTS = frozenset({"окно", "окна", "-", "—", "–", "нет", "нет пар"})
+
 
 def esc(value) -> str:
     return html.escape(str(value), quote=False)
+
+
+def _clean_subject(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _subject_of(entry) -> str:
+    """Предмет пары из датакласса/строки БД или dict."""
+    if isinstance(entry, dict):
+        return _clean_subject(entry.get("subject"))
+    return _clean_subject(getattr(entry, "subject", ""))
+
+
+def is_real_lesson(entry) -> bool:
+    """Настоящая пара: предмет не пустой и не пометка «окно».
+
+    Пустые строки и «окна» не считаются парами (ни в «всего N пар»,
+    ни в состоянии «сейчас/следующая»), но отображаются как «пара — окно».
+    """
+    s = _subject_of(entry).lower().strip(" .,:;!")
+    return bool(s) and s not in _WINDOW_SUBJECTS
 
 
 def _emoji_num(n: int) -> str:
@@ -113,7 +137,7 @@ def get_current_state(entries, now: datetime) -> State:
         return State(kind="empty")
 
     active = sorted(
-        [e for e in entries if (getattr(e, "subject", "") or "").strip()],
+        [e for e in entries if is_real_lesson(e)],
         key=lambda e: e.lesson_number,
     )
     if not active:
@@ -319,17 +343,18 @@ def _render_lesson_block(entry, n: int, bells, teacher_mode: bool) -> str:
 def _render_lessons(entries, bells, empty_text: str, *, teacher_mode: bool = False) -> str:
     by_num = {e.lesson_number: e for e in entries}
     nums = sorted(by_num)
-    active_nums = [n for n in nums if (by_num[n].subject or "").strip()]
+    active_nums = [n for n in nums if is_real_lesson(by_num[n])]
     if not active_nums:
         return f"<i>{esc(empty_text)}</i>"
 
-    # показываем от первой записи в расписании до последней непустой пары
+    # Нумерация НЕ сдвигается: идём по реальным номерам пар из столбца чисел.
+    # «1 пара — окно» остаётся первой, следующая пара — «2 пара».
     first, last = nums[0], active_nums[-1]
     blocks: list[str] = []
 
     for n in range(first, last + 1):
         entry = by_num.get(n)
-        if entry is None or not (entry.subject or "").strip():
+        if entry is None or not is_real_lesson(entry):
             blocks.append(f"{_emoji_num(n)} <i>пара — окно</i>")
             continue
         blocks.append(_render_lesson_block(entry, n, bells, teacher_mode))
@@ -388,7 +413,7 @@ def format_notification(
     weekday = _weekday_of(date_label, ref)
     bells = bells_for_weekday(weekday)
     active = sorted(
-        [e for e in entries if (e.subject or "").strip()],
+        [e for e in entries if is_real_lesson(e)],
         key=lambda e: e.lesson_number,
     )
 
