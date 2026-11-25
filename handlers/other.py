@@ -7,11 +7,12 @@ OtherStates.choosing, и в этом состоянии обработчик g: 
 """
 import html
 import logging
+from datetime import date, timedelta
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from db import SessionLocal
 from db import crud
@@ -19,7 +20,7 @@ from handlers import menu_dispatch
 from keyboards.groups import build_specialties_keyboard
 from keyboards.menu import BTN_OTHER_GROUP, build_main_menu
 from services import formatting, watcher
-from utils import today_ddmm
+from utils import ddmm, now, today_ddmm
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -27,6 +28,44 @@ router = Router()
 
 class OtherStates(StatesGroup):
     choosing = State()
+    browsing = State()
+
+
+def _other_nav_keyboard(day: date) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"og:day:{(day - timedelta(days=1)).isoformat()}"),
+            InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"og:day:{(day + timedelta(days=1)).isoformat()}"),
+        ],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="og:home")],
+    ])
+
+
+async def _other_day_text(group: str, day: date, bot) -> str:
+    label = ddmm(day)
+    async with SessionLocal() as session:
+        entries = await crud.get_schedule(session, label, group)
+    if not entries:
+        try:
+            await watcher.run_check(bot)
+        except Exception:
+            logger.exception("ошибка принудительной загрузки расписания другой группы")
+        async with SessionLocal() as session:
+            entries = await crud.get_schedule(session, label, group)
+            known = await crud.list_known(session)
+    else:
+        async with SessionLocal() as session:
+            known = await crud.list_known(session)
+
+    if entries:
+        return formatting.format_schedule(
+            label, group, entries, now=now() if day == now().date() else None,
+            with_state=False, empty_text="Пар нет 🎉",
+        )
+    known_dates = {watcher._date_from_filename(item.date_folder) for item in known}
+    if label in known_dates:
+        return f"📅 <b>Расписание на {label}</b>\n👥 {html.escape(group, quote=False)}\n\nПар нет 🎉"
+    return f"📅 <b>Расписание на {label}</b>\n👥 {html.escape(group, quote=False)}\n\nРасписание на этот день не загружено."
 
 
 @router.message(F.text == BTN_OTHER_GROUP)
@@ -78,42 +117,54 @@ async def cb_other_spec(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_other_group(callback: CallbackQuery, state: FSMContext, bot) -> None:
     """Шаг 2 в режиме просмотра: показываем расписание, НЕ сохраняя группу."""
     group = callback.data[len("g:"):]
-    await state.update_data(other_group=group)
+    await state.update_data(other_group=group, other_date=now().date().isoformat())
+    await state.set_state(OtherStates.browsing)
     await callback.answer(f"Просмотр: {group}")
-
-    label = today_ddmm()
-    async with SessionLocal() as session:
-        entries = await crud.get_schedule(session, label, group)
-    if not entries:
-        try:
-            await watcher.run_check(bot)
-        except Exception:
-            logger.exception("ошибка принудительной загрузки расписания")
-        async with SessionLocal() as session:
-            entries = await crud.get_schedule(session, label, group)
-
-    if entries:
-        text = formatting.format_schedule(
-            label,
-            group,
-            entries,
-            now=None,
-            with_state=False,
-            empty_text="Пар нет 🎉",
-        )
-    else:
-        text = f"📅 <b>{html.escape(group, quote=False)} — {label}</b>\n\nРасписание не загружено."
-
+    day = now().date()
+    text = await _other_day_text(group, day, bot)
     if callback.message:
         try:
-            await callback.message.edit_text(text, reply_markup=None)
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_other_nav_keyboard(day))
         except Exception:
-            await callback.message.answer(text, reply_markup=None)
-        # Тихо выходим из режима: расписание показано, ничего лишнего не шлём.
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=_other_nav_keyboard(day))
+
+
+@router.callback_query(OtherStates.browsing, F.data.startswith("og:day:"))
+async def cb_other_day(callback: CallbackQuery, state: FSMContext, bot) -> None:
+    try:
+        day = date.fromisoformat(callback.data.removeprefix("og:day:"))
+    except ValueError:
+        await callback.answer("Не удалось определить дату", show_alert=True)
+        return
+    data = await state.get_data()
+    group = data.get("other_group")
+    if not group:
+        await callback.answer("Сначала выбери группу", show_alert=True)
         await state.clear()
+        return
+    await callback.answer()
+    text = await _other_day_text(group, day, bot)
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_other_nav_keyboard(day))
+        except Exception:
+            pass
+
+
+@router.callback_query(OtherStates.browsing, F.data == "og:home")
+async def cb_other_home(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer("Главное меню 👇", reply_markup=build_main_menu())
 
 
 @router.message(OtherStates.choosing)
+@router.message(OtherStates.browsing)
 async def other_state_message(message: Message, state: FSMContext) -> None:
     """Любой текст в режиме просмотра: кнопка меню — выйти и выполнить её."""
     if await menu_dispatch.cancel_fsm_on_menu(message, state):
