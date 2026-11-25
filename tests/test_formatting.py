@@ -348,3 +348,33 @@ def test_state_ignores_window_rows():
     assert state.kind == "before"
     assert state.next_lesson.lesson_number == 2
     assert state.until == "10:20"
+
+
+def test_duplicate_rows_counted_once():
+    """Дубли строк одной пары не удваивают «всего N пар» (было 6 вместо 3)."""
+    entries = [
+        entry(1, subject="История", room="310"),
+        entry(2, subject="ОСиСР", room="139"),
+        entry(3, subject="Элементы высшей математики", room="315"),
+        # дубли: группа встретилась в файле дважды
+        entry(1, subject="История", room="310"),
+        entry(2, subject="ОСиСР", room="139"),
+        entry(3, subject="Элементы высшей математики", room="315"),
+    ]
+    text = format_notification("20.11", "1ИСИП-25-9", entries,
+                               now=datetime(2026, 11, 20, 9, 0))
+    assert "всего 3 пар" in text
+    # каждая пара показана ровно один раз
+    assert text.count("История") == 1
+    assert text.count("ОСиСР") == 1
+
+
+def test_duplicate_empty_row_does_not_hide_pair():
+    """Пустой дубль не затирает настоящую пару (не превращает её в окно)."""
+    text = format_schedule(
+        "20.11", "1ИСИП-25-9",
+        [entry(1, subject="История", room="310"), entry(1, subject="")],
+        now=datetime(2026, 11, 20, 12, 0),
+    )
+    assert "История" in text
+    assert "пара — окно" not in text

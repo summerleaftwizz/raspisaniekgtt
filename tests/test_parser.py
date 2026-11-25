@@ -387,3 +387,41 @@ def test_parse_raises_on_unknown_format():
         pd.DataFrame({"foo": [1, 2, 3]}).to_excel(writer, sheet_name="S", index=False)
     with pytest.raises(ParseError):
         parse_schedule(buf.getvalue(), settings.parser)
+
+
+def make_group_twice_xlsx() -> bytes:
+    """Одна и та же группа на двух листах файла: пары склеиваются,
+    но номера повторяются (1,2,1,2) — раньше давало «всего 6 пар»."""
+    buf = io.BytesIO()
+    df = pd.DataFrame(
+        [
+            ["Пара", "Дисциплина", "Ауд."],
+            [None, "1ИСИП-25-9", None],
+            [1, "История", "310"],
+            [2, "Математика", "307"],
+        ]
+    )
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Лист1", index=False, header=False)
+        df.to_excel(writer, sheet_name="Лист2", index=False, header=False)
+    return buf.getvalue()
+
+
+def test_duplicate_group_on_two_sheets_deduped():
+    """Повтор группы не создаёт дубли пар с теми же номерами."""
+    groups = parse_schedule(make_group_twice_xlsx(), settings.parser)
+    lessons = groups["1ИСИП-25-9"]
+    assert [l.lesson_number for l in lessons] == [1, 2]
+    assert [l.subject for l in lessons] == ["История", "Математика"]
+    assert [l.room for l in lessons] == ["310", "307"]
+
+
+def test_dedupe_lessons_prefers_real_pair_over_window():
+    """Дубль-«окно» не затирает настоящую пару с тем же номером."""
+    from services.parser import Lesson, _dedupe_lessons
+
+    real = Lesson(lesson_number=1, time="", subject="История", room="310",
+                  teacher="Савкина А. А.")
+    window = Lesson(lesson_number=1, time="", subject="", room="", teacher="")
+    assert [l.subject for l in _dedupe_lessons([real, window])] == ["История"]
+    assert [l.subject for l in _dedupe_lessons([window, real])] == ["История"]

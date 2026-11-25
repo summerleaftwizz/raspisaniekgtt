@@ -209,13 +209,46 @@ async def list_teacher_catalog(
     return sorted(seen, key=lambda t: t[0])
 
 
+def _entry_score(row: models.ScheduleEntry) -> tuple[int, int]:
+    """«Лучше» строка пары: сначала наличие предмета, потом число полей."""
+
+    def filled(value) -> bool:
+        return bool(value and str(value).strip())
+
+    return (
+        1 if filled(row.subject) else 0,
+        sum(
+            1
+            for value in (row.subject, row.room, row.teacher, row.subgroups)
+            if filled(value)
+        ),
+    )
+
+
+def _dedupe_rows(
+    rows: list[models.ScheduleEntry],
+) -> list[models.ScheduleEntry]:
+    """Одна строка на номер пары (дубли из старых парсингов).
+
+    Если группа встречалась в файле дважды, в БД лежали дубли строк:
+    счётчик «всего N пар» и API считали бы каждую строку. Оставляем
+    запись с предметом (и с наибольшим числом заполненных полей).
+    """
+    best: dict[int, models.ScheduleEntry] = {}
+    for row in rows:
+        current = best.get(row.lesson_number)
+        if current is None or _entry_score(row) > _entry_score(current):
+            best[row.lesson_number] = row
+    return [best[n] for n in sorted(best)]
+
+
 async def get_schedule(session: AsyncSession, date: str, group: str) -> list[models.ScheduleEntry]:
     res = await session.execute(
         select(models.ScheduleEntry)
         .where(models.ScheduleEntry.date == date, models.ScheduleEntry.group == group)
         .order_by(models.ScheduleEntry.lesson_number)
     )
-    return list(res.scalars())
+    return _dedupe_rows(list(res.scalars()))
 
 
 # ------------------------------------------------------------- snapshots ---

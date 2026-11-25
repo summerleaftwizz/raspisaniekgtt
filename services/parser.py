@@ -28,6 +28,7 @@ from typing import Optional
 import pandas as pd
 
 from config import ParserConfig
+from services.formatting import is_real_lesson
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,7 @@ def _is_room_like(value: str) -> bool:
     if not s:
         return False
     low = s.lower()
-    if low in {"max", "макс"}:
+    if low in {"max", "макс", "сам.изуч", "сам изуч", "самостоятельное изучение"}:
         return True
     if ROOM_HINT_RE.search(low) and any(ch.isdigit() for ch in s):
         return True
@@ -496,6 +497,37 @@ def _same_subject(a: str, b: str) -> bool:
     if not a or not b:
         return False
     return a.startswith(b) or b.startswith(a)
+
+
+def _dedupe_lessons(lessons: list["Lesson"]) -> list["Lesson"]:
+    """Схлопывает дубли пар с одинаковым номером.
+
+    Группа может встретиться в файле дважды (второй лист / повторная
+    шапка) — тогда её пары склеиваются в один список, но номера
+    повторяются. Рисунок показывает по одному номеру («3 пары»), а
+    счётчик «всего N пар» считает каждую запись — отсюда «6 пар»
+    вместо 3. Оставляем одну запись на номер: пару с настоящим
+    предметом, дополняя её пустые поля из дубля.
+    """
+    by_num: dict[int, Lesson] = {}
+    for lesson in lessons:
+        current = by_num.get(lesson.lesson_number)
+        if current is None:
+            by_num[lesson.lesson_number] = lesson
+            continue
+        keep, extra = current, lesson
+        if not is_real_lesson(current) and is_real_lesson(lesson):
+            keep, extra = lesson, current
+        _merge_lesson(keep, extra.subject, extra.teacher, extra.room)
+        if not keep.subgroups and extra.subgroups:
+            keep.subgroups = extra.subgroups
+        by_num[keep.lesson_number] = keep
+    if len(by_num) != len(lessons):
+        logger.warning(
+            "схлопнуты дубли пар по номеру: %d записей -> %d",
+            len(lessons), len(by_num),
+        )
+    return [by_num[n] for n in sorted(by_num)]
 
 
 # ------------------------------------------------------ поиск колонки пары ----
@@ -853,12 +885,16 @@ def _extract_subgroups(
             elif _is_subject_like(cell) and (
                 _same_subject(cell, main_subject) or not _looks_like_data(cell)
             ):
+                # In the student workbook, split language lessons are laid
+                # out as subject | room | subject | room, with each teacher
+                # in the row below the subject. Start a subgroup at each
+                # repeated subject so the following room stays with it.
                 start(teacher=under)
             else:
                 room = _clean_room(cell) or None
-                if current is not None and not current.room:
+                if current is not None and not current.room and _is_room_like(cell):
                     current.room = room
-                else:
+                elif _is_room_like(cell):
                     start(room=room)
             empty_gap = 0
             continue
@@ -1233,4 +1269,10 @@ def parse_schedule(content: bytes, cfg: ParserConfig) -> dict[str, list[Lesson]]
 
     if not groups:
         raise ParseError("ни один лист не удалось распарсить: " + "; ".join(errors))
+
+    # Одна и та же группа могла попасть в файл дважды (второй лист /
+    # повторная шапка) — пары склеились, но номера повторяются. Убираем
+    # дубли, чтобы «всего N пар» считало пары, а не записи.
+    for g in groups:
+        groups[g] = _dedupe_lessons(groups[g])
     return groups

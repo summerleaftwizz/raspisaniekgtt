@@ -231,6 +231,8 @@ def _room_text(room) -> str:
         return ""
     if r.lower() == "max":
         return "пара в максе"
+    if r.lower() in {"сам.изуч", "сам изуч", "самостоятельное изучение"}:
+        return "сам.изуч"
     return f"каб. {esc(r)}"
 
 
@@ -262,6 +264,8 @@ def _subgroup_room(room) -> str:
         return ""
     if r.lower() == "max":
         return "пара в максе"
+    if r.lower() in {"сам.изуч", "сам изуч", "самостоятельное изучение"}:
+        return "сам.изуч"
     r = re.sub(r"^(?:ауд\.?|каб\.?)\s*", "", r, flags=re.IGNORECASE)
     # «Ино 319» / «Ино... 319» -> «319»; без цифр оставляем как есть
     m = re.search(r"\d+\s*[A-Za-zА-Яа-я]?", r)
@@ -275,7 +279,7 @@ def _subgroup_line(number: int, sub) -> str:
     parts = []
     room = _subgroup_room(_sub_value(sub, "room"))
     if room:
-        parts.append(f"ауд. {esc(room)}")
+        parts.append(esc(room) if room == "сам.изуч" or room == "пара в максе" else f"ауд. {esc(room)}")
     teacher = (_sub_value(sub, "teacher", "") or "").strip()
     if teacher:
         parts.append(esc(teacher))
@@ -311,7 +315,8 @@ def _lesson_subject(entry, teacher_mode: bool) -> str:
 
 def _lesson_place(entry, teacher_mode: bool) -> str:
     """Строка «кабинет · преподаватель» (у преподавателя — только кабинет)."""
-    room = _room_text(getattr(entry, "room", ""))
+    raw_room = (getattr(entry, "room", "") or "").strip()
+    room = raw_room if raw_room.lower() in {"сам.изуч", "сам изуч", "самостоятельное изучение"} else _room_text(raw_room)
     if teacher_mode:
         return f"🚪 {room}" if room else ""
     teacher = (getattr(entry, "teacher", "") or "").strip()
@@ -341,7 +346,14 @@ def _render_lesson_block(entry, n: int, bells, teacher_mode: bool) -> str:
 
 
 def _render_lessons(entries, bells, empty_text: str, *, teacher_mode: bool = False) -> str:
-    by_num = {e.lesson_number: e for e in entries}
+    # Дубли одного номера (старые данные в БД): показываем пару с
+    # предметом, а не пустую строку-дубль («пара — окно»).
+    by_num: dict[int, object] = {}
+    for e in entries:
+        n = e.lesson_number
+        current = by_num.get(n)
+        if current is None or (is_real_lesson(e) and not is_real_lesson(current)):
+            by_num[n] = e
     nums = sorted(by_num)
     active_nums = [n for n in nums if is_real_lesson(by_num[n])]
     if not active_nums:
@@ -412,18 +424,17 @@ def format_notification(
     ref = now or _now()
     weekday = _weekday_of(date_label, ref)
     bells = bells_for_weekday(weekday)
-    active = sorted(
-        [e for e in entries if is_real_lesson(e)],
-        key=lambda e: e.lesson_number,
-    )
+    # Считаем УНИКАЛЬНЫЕ номера пар: дубли строк одной и той же пары
+    # (группа встретилась в файле дважды) не должны удваивать «всего N пар».
+    active_nums = sorted({e.lesson_number for e in entries if is_real_lesson(e)})
 
     lines = [f"🔔 <b>Появилось новое расписание на {esc(date_label)}!</b>", ""]
     lines.extend(_header(date_label, group, ref, teacher_mode))
-    if active:
-        b = bells.get(active[0].lesson_number)
+    if active_nums:
+        b = bells.get(active_nums[0])
         start = b[0] if b else "—"
         lines.append("")
-        lines.append(f"🔔 <i>Начало занятий в {esc(start)}, всего {len(active)} пар</i>")
+        lines.append(f"🔔 <i>Начало занятий в {esc(start)}, всего {len(active_nums)} пар</i>")
     lines.append("")
     lines.append(SEPARATOR)
     lines.append("")
